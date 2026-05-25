@@ -49,6 +49,7 @@ See `examples/usage.sh` and `examples/usage.py` for integration templates.
 - `permission_denials` and `api_error_status` are stubs. Derivable from the transcript but format-fragile; not implemented.
 - `num_turns` counts every `assistant` record (including `ai-title` generation), so it can be higher than `-p`'s.
 - Wall-clock is ~1-2s slower than plain `-p` due to TUI bringup and the post-response statusline poll.
+- **Snap serializes only claude's supervisor startup race, not the full turn.** Claude's TUI mode races on a singleton supervisor lock during the first ~1s of boot; two TUIs starting simultaneously leave one (or both) hung. Once a claude is past that window, additional claudes can run in parallel. Snap holds a mkdir-based lock at `${CLAUDE_CONFIG_DIR:-~/.claude}/.snap-lock/` to gate that startup window, then hands the lock off as soon as the statusline sidecar appears (signal that claude reached steady state). Parallel callers queue at startup but run concurrently after that. Knobs: `CLAUDE_SNAP_LOCK_WAIT_SEC` (acquire timeout, default 600s), `CLAUDE_SNAP_LOCK_HOLD_SEC` (hard hold cap if the sidecar never appears, default 10s), `CLAUDE_SNAP_NO_LOCK=1` (skip the lock entirely — only safe when the caller already guarantees serial startup). Stale locks (holder PID dead) are stolen automatically.
 
 ## Uninstall
 

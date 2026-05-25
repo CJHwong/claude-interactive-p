@@ -56,12 +56,113 @@ case "$last_arg" in
 esac
 
 tmp_dir=$(mktemp -d -t claude-snap.XXXXXX)
-cleanup() { rm -rf "$tmp_dir" 2>/dev/null || true; }
+lock_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.snap-lock"
+release_pid=""
+# Cleanup releases our lock only if it's still ours — once the early-release
+# watcher hands the lock off to a sibling snap, that sibling's PID is in
+# $lock_dir/pid and we must not blow it away on our EXIT.
+cleanup() {
+  rm -rf "$tmp_dir" 2>/dev/null || true
+  if [ -n "$release_pid" ]; then
+    kill "$release_pid" 2>/dev/null || true
+    wait "$release_pid" 2>/dev/null || true
+  fi
+  if [ -d "$lock_dir" ]; then
+    local holder=""
+    holder=$(cat "$lock_dir/pid" 2>/dev/null || true)
+    if [ "$holder" = "$$" ]; then
+      rm -rf "$lock_dir" 2>/dev/null || true
+    fi
+  fi
+}
 trap cleanup EXIT
 
 export CLAUDE_SNAP_ENVELOPE="$tmp_dir/envelope.json"
 export CLAUDE_SNAP_SIDECAR="$tmp_dir/sidecar.json"
 export CLAUDE_SNAP_DEBUG_LOG="${CLAUDE_SNAP_DEBUG_LOG:-$tmp_dir/debug.log}"
+
+# Serialize ONLY claude's supervisor startup race. Claude's TUI mode races
+# on a singleton supervisor lock during the first ~1s of boot; two TUIs
+# starting simultaneously leave one (or both) hung. Once a claude is past
+# that window, additional claudes can run in parallel without conflict.
+# So we acquire a mkdir-based lock to gate startup, then release it as
+# soon as our claude reaches steady state — signalled by the statusline
+# shim writing CLAUDE_SNAP_SIDECAR — so the next snap can start its own
+# claude while ours keeps running.
+#
+# Stale-lock recovery: holder PID's liveness is checked via kill -0, so a
+# SIGKILL'd snap doesn't deadlock successors. Tuning knobs:
+#   CLAUDE_SNAP_LOCK_WAIT_SEC  total wait at acquire (default 600s)
+#   CLAUDE_SNAP_LOCK_HOLD_SEC  max hold after acquire if the sidecar
+#                              never appears (default 10s)
+#   CLAUDE_SNAP_NO_LOCK=1      skip the lock entirely.
+acquire_snap_lock() {
+  [ "${CLAUDE_SNAP_NO_LOCK:-0}" = "1" ] && return 0
+  local wait_max="${CLAUDE_SNAP_LOCK_WAIT_SEC:-600}"
+  local start_epoch
+  start_epoch=$(date +%s)
+  local holder=""
+  while true; do
+    if mkdir "$lock_dir" 2>/dev/null; then
+      printf '%s\n' "$$" > "$lock_dir/pid"
+      return 0
+    fi
+    # Stale lock: if the holder PID file is readable and the PID is dead,
+    # take ownership. Empty PID file means an in-progress acquire raced;
+    # leave it alone and retry.
+    if [ -f "$lock_dir/pid" ]; then
+      holder=$(cat "$lock_dir/pid" 2>/dev/null || true)
+      if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
+        rm -rf "$lock_dir" 2>/dev/null || true
+        continue
+      fi
+    fi
+    local now
+    now=$(date +%s)
+    if [ $((now - start_epoch)) -ge "$wait_max" ]; then
+      echo "claude-snap: lock wait timeout after ${wait_max}s (holder pid=${holder:-unknown})" >&2
+      echo "claude-snap: set CLAUDE_SNAP_LOCK_WAIT_SEC to wait longer, or CLAUDE_SNAP_NO_LOCK=1 to skip" >&2
+      exit 1
+    fi
+    # Tight poll: typical hold is ~500ms, so a 500ms poll could waste nearly
+    # the whole win waiting to notice the lock free. 50ms keeps the acquire
+    # gap to one tick.
+    sleep 0.05
+  done
+}
+
+# Background watcher: hand the lock off to the next snap as soon as our
+# claude reaches steady state. The signal is the statusline sidecar file
+# appearing (statusline.sh writes it ~500ms after first tick). Falls back
+# to a hard timeout in case the statusline isn't wired.
+release_lock_after_startup() {
+  [ "${CLAUDE_SNAP_NO_LOCK:-0}" = "1" ] && return 0
+  local hold_max="${CLAUDE_SNAP_LOCK_HOLD_SEC:-10}"
+  local ticks_max=$((hold_max * 10))
+  local ticks=0
+  while [ "$ticks" -lt "$ticks_max" ]; do
+    if [ -f "$CLAUDE_SNAP_SIDECAR" ]; then
+      break
+    fi
+    sleep 0.1
+    ticks=$((ticks + 1))
+  done
+  # Only release if the lock is still ours; a SIGKILL'd predecessor could
+  # have had its lock stolen by a sibling already.
+  local holder=""
+  if [ -d "$lock_dir" ]; then
+    holder=$(cat "$lock_dir/pid" 2>/dev/null || true)
+    if [ "$holder" = "$$" ]; then
+      rm -rf "$lock_dir" 2>/dev/null || true
+    fi
+  fi
+}
+
+acquire_snap_lock
+if [ "${CLAUDE_SNAP_NO_LOCK:-0}" != "1" ]; then
+  release_lock_after_startup &
+  release_pid=$!
+fi
 
 # Wall-clock timer for duration_ms. If python3 isn't available, emit JSON
 # null in the envelope rather than lying with 0.
