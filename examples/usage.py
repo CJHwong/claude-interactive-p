@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Minimal Python usage: drive claude-snap, parse the JSON envelope.
+"""Minimal Python usage: drive claude-pty, parse the JSON envelope.
 
 Intended as the integration template for claude-on-the-fly's claude backend:
-replace its `-p --output-format=json` subprocess call with `snap()` below and
+replace its `-p --output-format=json` subprocess call with `claude_pty()` below and
 you gain the statusline subtree (rate_limits, context_window, etc.) without
 changing the call shape.
 """
@@ -17,27 +17,27 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-CLAUDE_SNAP = REPO_ROOT / "bin" / "claude-snap"
+CLAUDE_PTY = REPO_ROOT / "bin" / "claude-pty"
 
 
-def snap(
+def claude_pty(
     prompt: str,
     *,
     model: str | None = None,
     config_dir: str | None = None,
     extra_args: list[str] | None = None,
 ) -> dict:
-    """Run claude-snap and return the parsed envelope.
+    """Run claude-pty and return the parsed envelope.
 
     Raises subprocess.CalledProcessError on non-zero exit; stderr is captured.
     """
     env = os.environ.copy()
     if config_dir:
         env["CLAUDE_CONFIG_DIR"] = config_dir
-    # No CLAUDE_CONFIG_DIR check: claude defaults to ~/.claude. The snap
+    # No CLAUDE_CONFIG_DIR check: claude defaults to ~/.claude. The claude-pty
     # hooks must already be installed into whatever config dir claude reads.
 
-    cmd: list[str] = [str(CLAUDE_SNAP)]
+    cmd: list[str] = [str(CLAUDE_PTY)]
     if model:
         cmd += ["--model", model]
     if extra_args:
@@ -51,7 +51,7 @@ def snap(
 
 
 if __name__ == "__main__":
-    envelope = snap(
+    envelope = claude_pty(
         prompt=sys.argv[1] if len(sys.argv) > 1 else "Reply with only the word PONG.",
         model="haiku",
     )

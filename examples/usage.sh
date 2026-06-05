@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Minimal shell usage: drive claude-snap, get JSON envelope, slice it with jq.
+# Minimal shell usage: drive claude-pty, get JSON envelope, slice it with jq.
 set -eu
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
 # Uses whatever Claude config `claude` would use (default ~/.claude, or
-# CLAUDE_CONFIG_DIR if you have it set). The snap hooks must already be
+# CLAUDE_CONFIG_DIR if you have it set). The claude-pty hooks must already be
 # installed into that config; see install.sh.
-envelope=$("$REPO_DIR/bin/claude-snap" --model haiku "Reply with only the word PONG.")
+envelope=$("$REPO_DIR/bin/claude-pty" --model haiku "Reply with only the word PONG.")
 
 # Pull anything you need; here are the interesting fields.
 echo "$envelope" | jq '{

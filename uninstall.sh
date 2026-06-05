@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Reverse install.sh: remove the snap statusLine + Stop hook from settings.json.
+# Reverse install.sh: remove the claude-pty statusLine + Stop hook from settings.json.
 # Leaves a backup and prints any prior statusLine.command you may want to
 # restore manually.
 #
@@ -22,13 +22,13 @@ echo "uninstall.sh: backup written to $SETTINGS.bak.$ts"
 
 # If install.sh saved a prior statusLine.command, restore it as part of the
 # round-trip. Otherwise the statusLine key is removed entirely.
-PRIOR_STATUSLINE_FILE="$CFG_DIR/.snap-prior-statusline"
+PRIOR_STATUSLINE_FILE="$CFG_DIR/.pty-prior-statusline"
 prior_sl=""
 if [ -f "$PRIOR_STATUSLINE_FILE" ]; then
   prior_sl=$(cat "$PRIOR_STATUSLINE_FILE")
 fi
 
-# Drop or restore the statusLine; drop the snap Stop hook entry. Other hooks
+# Drop or restore the statusLine; drop the claude-pty Stop hook entry. Other hooks
 # and settings keys are untouched.
 updated=$(jq \
   --arg shim "$SHIM" \

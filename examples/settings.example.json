@@ -3,12 +3,12 @@
 
   "statusLine": {
     "type": "command",
-    "_about": "Points at the snap shim. The shim writes a sidecar file when CLAUDE_SNAP_SIDECAR is set (snap mode) and otherwise execs the command in $CLAUDE_SNAP_REAL_STATUSLINE so your normal TUI output is preserved.",
+    "_about": "Points at the claude-pty shim. The shim writes a sidecar file when CLAUDE_PTY_SIDECAR is set (claude-pty mode) and otherwise execs the command in $CLAUDE_PTY_REAL_STATUSLINE so your normal TUI output is preserved.",
     "command": "/absolute/path/to/claude-interactive-p/hooks/statusline.sh"
   },
 
   "hooks": {
-    "_about_stop": "Stop fires once per turn after Claude finishes responding. The hook no-ops unless CLAUDE_SNAP_ENVELOPE is set in env, so regular interactive sessions are unaffected. When snap mode IS on, it polls for the post-response statusline tick, writes the final JSON envelope, and SIGTERMs the parent claude process so the TUI exits.",
+    "_about_stop": "Stop fires once per turn after Claude finishes responding. The hook no-ops unless CLAUDE_PTY_ENVELOPE is set in env, so regular interactive sessions are unaffected. When claude-pty mode IS on, it polls for the post-response statusline tick and writes the final JSON envelope; the claude-pty wrapper detects that envelope and terminates claude (the hook no longer kills it).",
     "Stop": [
       {
         "hooks": [

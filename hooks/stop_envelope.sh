@@ -1,18 +1,24 @@
 #!/usr/bin/env bash
 # Stop hook for "interactive-p" mode.
-#   - If CLAUDE_SNAP_ENVELOPE is unset, do nothing (normal interactive session).
-#   - Otherwise: merge Stop stdin + statusline sidecar into a draft envelope,
-#     write it atomically to CLAUDE_SNAP_ENVELOPE, then SIGTERM the parent claude
-#     TUI process so it exits. The wrapper enriches with transcript-derived
-#     fields (usage/stop_reason/num_turns) AFTER claude exits, when the
-#     transcript JSONL is fully flushed.
+#   - If CLAUDE_PTY_ENVELOPE is unset, do nothing (normal interactive session).
+#   - Otherwise: merge Stop stdin + statusline sidecar into a draft envelope and
+#     write it atomically to CLAUDE_PTY_ENVELOPE. That is the ONLY job — the
+#     envelope's appearance is the "turn done" signal. The parent (claude-pty)
+#     polls for it and terminates claude itself.
+#
+# Why the hook no longer kills claude: it used to `kill -TERM $PPID`, assuming
+# $PPID was the claude TUI. Newer Claude Code (2.1.x) invokes hook commands via
+# a shell wrapper, so $PPID is that shell, not claude — the TUI survived,
+# claude-pty blocked forever, and the claude-pty/script/claude tree leaked as
+# orphans. Letting the parent own the kill is version-proof: it knows the real
+# child pid (and, in tmux mode, the session).
 set -euo pipefail
 input=$(cat)
 
-DEBUG_LOG="${CLAUDE_SNAP_DEBUG_LOG:-}"
+DEBUG_LOG="${CLAUDE_PTY_DEBUG_LOG:-}"
 log() { [ -n "$DEBUG_LOG" ] && printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$DEBUG_LOG" || true; }
 
-if [ -z "${CLAUDE_SNAP_ENVELOPE:-}" ]; then
+if [ -z "${CLAUDE_PTY_ENVELOPE:-}" ]; then
   log "no envelope env, no-op"
   exit 0
 fi
@@ -25,23 +31,23 @@ fi
 # avoids the same-integer-second race where a sidecar written in the same
 # second as the hook start would falsely match on the first check.
 sidecar='{}'
-if [ -n "${CLAUDE_SNAP_SIDECAR:-}" ]; then
+if [ -n "${CLAUDE_PTY_SIDECAR:-}" ]; then
   sidecar_mtime() {
-    stat -f %m "$CLAUDE_SNAP_SIDECAR" 2>/dev/null \
-      || stat -c %Y "$CLAUDE_SNAP_SIDECAR" 2>/dev/null \
+    stat -f %m "$CLAUDE_PTY_SIDECAR" 2>/dev/null \
+      || stat -c %Y "$CLAUDE_PTY_SIDECAR" 2>/dev/null \
       || echo 0
   }
   prev_mtime=$(sidecar_mtime)
   # Cap at 10 × 0.15s = 1.5s. statusline debounce is 300ms, so this gives
   # multiple chances to land plus headroom for slow disks.
   for _ in 1 2 3 4 5 6 7 8 9 10; do
-    if [ -f "$CLAUDE_SNAP_SIDECAR" ] && [ "$(sidecar_mtime)" -gt "$prev_mtime" ]; then
+    if [ -f "$CLAUDE_PTY_SIDECAR" ] && [ "$(sidecar_mtime)" -gt "$prev_mtime" ]; then
       break
     fi
     sleep 0.15
   done
-  if [ -f "$CLAUDE_SNAP_SIDECAR" ]; then
-    sidecar=$(cat "$CLAUDE_SNAP_SIDECAR")
+  if [ -f "$CLAUDE_PTY_SIDECAR" ]; then
+    sidecar=$(cat "$CLAUDE_PTY_SIDECAR")
   else
     log "sidecar never appeared, emitting envelope without statusline fields"
   fi
@@ -64,14 +70,8 @@ envelope=$(jq -n \
   }
 ')
 
-tmp="${CLAUDE_SNAP_ENVELOPE}.tmp.$$"
+tmp="${CLAUDE_PTY_ENVELOPE}.tmp.$$"
 printf '%s\n' "$envelope" > "$tmp"
-mv "$tmp" "$CLAUDE_SNAP_ENVELOPE"
-log "draft envelope written, killing ppid=$PPID"
-
-# $PPID is the claude TUI process, verified by ancestor walk during PoC.
-# Assumes claude execs the hook command as a direct child (current behavior).
-# If a future Claude Code version wraps hook invocations in a shell, $PPID
-# would point at that shell and the TUI wouldn't exit cleanly.
-kill -TERM "$PPID" >/dev/null 2>&1 || log "kill failed for ppid=$PPID"
+mv "$tmp" "$CLAUDE_PTY_ENVELOPE"
+log "draft envelope written; parent will detect + terminate claude"
 exit 0
