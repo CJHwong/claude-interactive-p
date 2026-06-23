@@ -116,6 +116,7 @@ All claude flags (`--model`, `--permission-mode`, etc.) pass through. `--help`, 
 | `CLAUDE_PTY_NO_LOCK` | unset | Set to `1` to skip startup serialization |
 | `CLAUDE_PTY_LOCK_WAIT_SEC` | `600` | Max seconds to wait for the startup lock |
 | `CLAUDE_PTY_LOCK_HOLD_SEC` | `10` | Max seconds to hold the lock if sidecar never appears |
+| `CLAUDE_PTY_TASK_WAIT_SEC` | `5400` | Max seconds to keep claude alive waiting for background subagents/teammates to finish before forcing termination |
 | `CLAUDE_PTY_DEBUG_LOG` | unset | File path for debug event log |
 
 ### JSON envelope shape
@@ -137,13 +138,13 @@ Superset of `claude -p --output-format=json`. Every `-p` key is present, plus:
 | `duration_ms` | Wall-clock measured by the wrapper |
 | `duration_api_ms` | From statusline `cost.total_api_duration_ms` |
 | `fast_mode_state` | `"on"` / `"off"` from statusline |
+| `terminal_reason` | Wrapper: `"completed"`, or `"background_timeout"` if the background-task wait cap fired |
 
 Stubs (always present, not implemented):
 
 | Field | Value |
 |---|---|
 | `ttft_ms` | `null` |
-| `terminal_reason` | `"completed"` |
 | `permission_denials` | `[]` |
 | `api_error_status` | `null` |
 | `is_error` | `false` |
@@ -175,7 +176,7 @@ Settings.json mutations:
 
 Three pieces run per turn:
 
-1. **`bin/claude-pty`** acquires the startup lock, then launches `claude` under a PTY (either `script` or tmux). It polls for the envelope file and terminates claude when it appears.
+1. **`bin/claude-pty`** acquires the startup lock, then launches `claude` under a PTY (either `script` or tmux). It polls for the envelope file, waits for any background subagents or teammates to finish (see [Waiting for background work](#waiting-for-background-work)), then terminates claude.
 
 2. **`hooks/statusline.sh`** replaces your `statusLine.command`. When `CLAUDE_PTY_SIDECAR` is set, it atomically writes each statusline tick to a sidecar file. It always delegates rendering to your real statusline (resolved from `CLAUDE_PTY_REAL_STATUSLINE`, then `.pty-prior-statusline`, then nothing).
 
@@ -187,13 +188,19 @@ Without the claude-pty env vars, both hooks no-op — safe to leave installed in
 
 The wrapper kills claude, not the Stop hook. The hook used to `kill $PPID`, but newer Claude Code wraps hook commands in a shell — `$PPID` was that shell, claude survived, the wrapper blocked forever, and the process tree leaked. Owning the kill means the wrapper knows the real child pid (and, in tmux mode, the session).
 
+### Waiting for background work
+
+A turn can finish (Stop fires, envelope written) while a subagent or teammate the agent spawned is still running. Killing claude then would cut that work off mid-flight. So after the first envelope appears, the wrapper keeps claude alive while `background_tasks` still lists a running `subagent`, `teammate`, or `workflow`, and finalizes only once they drain. The Stop hook rewrites the envelope on every turn, and a finished agent task drops out of `background_tasks`, so a later Stop shows it gone.
+
+Background shells (a dev server, `tail -f`) are not awaited: they finish without waking the session, so they never produce a draining Stop, and waiting on them would stall every turn that left one running. The whole wait is capped by `CLAUDE_PTY_TASK_WAIT_SEC` (default 1.5h); on expiry the wrapper finalizes the last envelope with `terminal_reason: "background_timeout"`. The cap is a backstop for a teammate that never finishes (for example one parked waiting for a message this single turn will never send), not a runtime limit: work that drains on its own ends the wait the moment it completes, however long it ran.
+
 ### Startup lock
 
 Claude's TUI mode races on a singleton supervisor lock during the first ~1s of boot. Two TUIs starting simultaneously leave one or both hung. claude-pty serializes only that window with a mkdir-based lock at `$CLAUDE_CONFIG_DIR/.pty-lock/`. Once the statusline sidecar appears (claude reached steady state), the lock is released so the next caller can start. Stale locks from dead holders are stolen automatically.
 
 ### Compatibility
 
-Tested against Claude Code `2.1.146`. The Stop hook reads `last_assistant_message` from stdin — undocumented, could be renamed or removed. If it breaks, the fallback is `transcript_path`.
+Tested against Claude Code `2.1.186`. The Stop hook reads `last_assistant_message` from stdin — undocumented, could be renamed or removed. If it breaks, the fallback is `transcript_path`. Teammate-aware waiting reads the `background_tasks` array from the Stop payload, available in Claude Code `2.1.145`+; on older versions the array is absent, so the wrapper finalizes on the first Stop as before.
 
 ### Caveats
 
