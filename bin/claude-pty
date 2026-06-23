@@ -177,6 +177,79 @@ pty_log() {
     || true
 }
 
+# --- Teammate-aware turn completion -----------------------------------------
+#
+# The Stop hook rewrites $CLAUDE_PTY_ENVELOPE every time claude finishes a turn,
+# and that envelope carries the live `background_tasks` snapshot. The naive
+# model — "first envelope appears, kill claude" — is wrong the moment a turn
+# spawns background agent work: claude's *visible* turn ends (Stop fires) while
+# a subagent/teammate is still running, so killing now murders that teammate
+# mid-flight. We have to keep the session alive until the agentic work drains.
+#
+# How "drained" becomes observable: when a subagent/teammate/workflow finishes,
+# it wakes the orchestrator, which produces a fresh turn -> a new Stop -> the
+# hook rewrites the envelope, and the finished task has DROPPED OUT of
+# background_tasks. So we wait while any awaited-type task is still listed.
+#
+# Why we await only subagent/teammate/workflow and not every task type: a
+# backgrounded *shell* (a dev server, `tail -f`, a watch) completes WITHOUT
+# waking the session, so it never produces a draining Stop — the envelope stays
+# frozen with that shell "running" indefinitely. Awaiting shells would stall
+# every turn that leaves a server running until the timeout. Shells/monitors/
+# crons are fire-and-forget here; we finalize as soon as the agentic tasks go.
+#
+# Set to "background_timeout" by the cap branch below; otherwise stays
+# "completed". Consumed by the final envelope's terminal_reason field.
+terminal_reason="completed"
+
+# Exit 0 while the latest envelope still lists an in-flight agentic background
+# task. Finished tasks drop out of the array, so presence == still running; we
+# deliberately don't gate on .status (its non-terminal vocabulary isn't a
+# documented, stable set, but the drop-out behavior is observable and reliable).
+agentic_tasks_in_flight() {
+  [ -f "$CLAUDE_PTY_ENVELOPE" ] || return 1
+  jq -e '
+    [ .background_tasks[]?
+      | select(.type == "subagent" or .type == "teammate" or .type == "workflow") ]
+    | length > 0
+  ' "$CLAUDE_PTY_ENVELOPE" > /dev/null 2>&1
+}
+
+# Liveness predicates for the two PTY backends, passed by name to the waiter.
+script_pty_alive()  { kill -0 "${pty_pid:-}" 2>/dev/null; }
+tmux_session_alive() { tmux has-session -t "${CLAUDE_PTY_TMUX_SESSION:-}" 2>/dev/null; }
+
+# Wait for the turn to truly finish: first for the envelope to appear (visible
+# turn ended), then for any agentic background work to drain. $1 is the name of
+# a predicate function that returns 0 while claude is still alive.
+#
+# The drain wait is bounded by CLAUDE_PTY_TASK_WAIT_SEC (default 5400s = 1.5h).
+# This cap is NOT a "max runtime": agentic work that drains on its own breaks
+# the loop the instant its waking Stop lands, no matter how long it ran (10s or
+# 3h). The cap only fires on work that CANNOT drain — a teammate parked idle
+# waiting for a message this one-shot run will never send, or a genuinely wedged
+# task. claude-pty can't distinguish a teammate working hard for an hour from
+# one stuck forever (the frozen envelope looks identical either way), so a
+# generous wall-clock cap is the only available backstop. 1.5h clears realistic
+# long teammate runs while still guaranteeing the run can never hang for good.
+wait_for_turn_completion() {
+  local alive_check="$1"
+  while [ ! -f "$CLAUDE_PTY_ENVELOPE" ] && "$alive_check"; do
+    sleep 0.2
+  done
+  local wait_max="${CLAUDE_PTY_TASK_WAIT_SEC:-5400}"
+  local wait_start
+  wait_start=$(date +%s)
+  while "$alive_check" && agentic_tasks_in_flight; do
+    if [ $(( $(date +%s) - wait_start )) -ge "$wait_max" ]; then
+      terminal_reason="background_timeout"
+      pty_log "agentic background task still in flight after ${wait_max}s; finalizing anyway"
+      break
+    fi
+    sleep 0.3
+  done
+}
+
 # Run claude under a PTY, wait for the turn to finish, then terminate claude.
 #
 # Turn completion is signalled by the Stop hook writing $CLAUDE_PTY_ENVELOPE.
@@ -221,10 +294,9 @@ run_claude_pty() {
       tmux kill-session -t "$CLAUDE_PTY_TMUX_SESSION" 2>/dev/null || true
       if tmux new-session -d -c "$PWD" -s "$CLAUDE_PTY_TMUX_SESSION" "$launch" 2> "$tmp_dir/tmux_err"; then
         pty_log "tmux session live: tmux attach -t $CLAUDE_PTY_TMUX_SESSION"
-        # Wait for the turn (envelope) or claude crashing (session vanishes).
-        while [ ! -f "$CLAUDE_PTY_ENVELOPE" ] && tmux has-session -t "$CLAUDE_PTY_TMUX_SESSION" 2>/dev/null; do
-          sleep 0.2
-        done
+        # Wait for the turn to finish (envelope written + agentic background
+        # work drained), or for claude to crash (session vanishes).
+        wait_for_turn_completion tmux_session_alive
         # Snapshot the pane's last screen before reaping it, so a resume error
         # or crash message claude printed survives in the debug log instead of
         # dying with the session (tmux mode has no typescript file).
@@ -246,10 +318,8 @@ run_claude_pty() {
   # The typescript goes to a file (not /dev/null) so claude's own terminal
   # output is recoverable when no envelope is produced (see the failure dump).
   script -q "$pty_typescript" claude "$@" > /dev/null 2>&1 &
-  local pty_pid=$!
-  while [ ! -f "$CLAUDE_PTY_ENVELOPE" ] && kill -0 "$pty_pid" 2>/dev/null; do
-    sleep 0.2
-  done
+  pty_pid=$!   # global (not local) so script_pty_alive can read it by name
+  wait_for_turn_completion script_pty_alive
   local kid
   for kid in $(pgrep -P "$pty_pid" 2>/dev/null); do kill -TERM "$kid" 2>/dev/null || true; done
   kill -TERM "$pty_pid" 2>/dev/null || true
@@ -350,7 +420,8 @@ fi
 jq -n \
   --argjson draft "$(cat "$CLAUDE_PTY_ENVELOPE")" \
   --argjson tx "$tx_facts" \
-  --argjson dur "$duration_ms" '
+  --argjson dur "$duration_ms" \
+  --arg term "$terminal_reason" '
   $draft + {
     is_error:           false,
     api_error_status:   null,
@@ -363,7 +434,7 @@ jq -n \
     usage:              $tx.usage,
     modelUsage:         $tx.modelUsage,
     permission_denials: [],
-    terminal_reason:    "completed",
+    terminal_reason:    $term,
     fast_mode_state:    (if ($draft.statusline.fast_mode // false) then "on" else "off" end),
     uuid:               $tx.uuid
   }
