@@ -1,6 +1,6 @@
 # claude-interactive-p
 
-A drop-in replacement for `claude -p --output-format=json` that runs through interactive mode under a PTY to surface statusline fields `-p` doesn't expose: rate limits, context window usage, fast mode state, and more.
+A drop-in replacement for `claude -p --output-format=json` that emits the same JSON envelope (a superset) on stdout. Given an attachable `tmux` target it drives a real interactive `claude` TUI — so an operator can `tmux attach` to watch or take over, and the statusline fields `-p` doesn't expose (rate limits, context window usage, fast mode state) are folded into the envelope. Without one it falls back to a headless subprocess that returns the same envelope minus those statusline-only fields.
 
 Built for [claude-on-the-fly](https://github.com/CJHwong/claude-on-the-fly).
 
@@ -52,7 +52,7 @@ Then in another terminal:
 tmux attach -t watch
 ```
 
-You see claude's live TUI. Any tmux failure falls back to the `script` PTY so it never costs a turn.
+You see claude's live TUI. This tmux backend is the only attachable mode. Any tmux failure falls back to the headless subprocess backend so it never costs a turn (you just lose attachability for that run).
 
 ### Drive from Python
 
@@ -61,14 +61,15 @@ from examples.usage import claude_pty
 
 envelope = claude_pty("Summarize this file.", model="sonnet")
 print(envelope["result"])
-print(envelope["statusline"]["cost"]["total_cost_usd"])
+print(envelope["total_cost_usd"])  # present in both backends; statusline-only fields need the tmux backend
 ```
 
 ### Drive from shell
 
 ```bash
 envelope=$(claude-pty --model haiku "Reply PONG.")
-echo "$envelope" | jq '{result, total_cost_usd, context_pct: .statusline.context_window.used_percentage}'
+echo "$envelope" | jq '{result, total_cost_usd, num_turns}'
+# .statusline.* (context_window, rate_limits, ...) is populated only in the tmux backend
 ```
 
 ### Update to latest
@@ -121,7 +122,7 @@ All claude flags (`--model`, `--permission-mode`, etc.) pass through. `--help`, 
 
 ### JSON envelope shape
 
-Superset of `claude -p --output-format=json`. Every `-p` key is present, plus:
+Superset of `claude -p --output-format=json`. Every `-p` key is present, plus the fields below. The `Source` column describes the **tmux backend**; the **subprocess backend** takes the core fields (`num_turns`, `usage`, `modelUsage`, `total_cost_usd`, `duration_ms`, `stop_reason`, `terminal_reason`, `fast_mode_state`, `uuid`, `is_error`) straight from `claude -p`'s own JSON, sets `statusline` to `null`, and leaves `background_tasks`/`session_crons` empty.
 
 | Field | Source |
 |---|---|
@@ -170,13 +171,22 @@ Settings.json mutations:
 
 ### Why not just `claude -p`?
 
-`claude -p --output-format=json` doesn't include rate limit counters, context window usage, fast mode state, or output style. Those fields only flow through the interactive TUI's statusline hook. claude-pty runs the interactive TUI under a PTY so the statusline shim can capture that data and fold it into the output envelope.
+For a headless run, `claude -p` is fine — and it's exactly what the subprocess backend uses. The reason to run the interactive TUI (tmux backend) is twofold: an operator can `tmux attach` to watch or take over a live turn, and the statusline fields `-p` doesn't expose (rate limit counters, context window usage, fast mode state, output style) flow only through the TUI's statusline hook, where the shim captures them into the envelope. When you don't have a tmux target, none of that is available, so the subprocess backend just returns `-p`'s JSON in envelope shape.
 
-### Pipeline
+### Backends
+
+The backend is chosen at runtime:
+
+- **tmux** (`CLAUDE_PTY_TMUX_SESSION` set + tmux available): interactive, attachable, statusline-enriched. Uses the per-turn pipeline below.
+- **subprocess** (otherwise): runs `claude -p --output-format=json` headless and normalizes the result. Not attachable, no statusline.
+
+A bare PTY headless (no controlling tty) gives claude a 0×0 terminal, and the TUI won't flush its transcript there, so an interactive non-tmux backend isn't viable — hence the subprocess fallback rather than a `script` PTY.
+
+### Pipeline (tmux backend)
 
 Three pieces run per turn:
 
-1. **`bin/claude-pty`** acquires the startup lock, then launches `claude` under a PTY (either `script` or tmux). It polls for the envelope file, waits for any background subagents or teammates to finish (see [Waiting for background work](#waiting-for-background-work)), then terminates claude.
+1. **`bin/claude-pty`** acquires the startup lock, then launches `claude` in a detached tmux session. It polls for the envelope file, waits for any background subagents or teammates to finish (see [Waiting for background work](#waiting-for-background-work)), then reaps the session.
 
 2. **`hooks/statusline.sh`** replaces your `statusLine.command`. When `CLAUDE_PTY_SIDECAR` is set, it atomically writes each statusline tick to a sidecar file. It always delegates rendering to your real statusline (resolved from `CLAUDE_PTY_REAL_STATUSLINE`, then `.pty-prior-statusline`, then nothing).
 
@@ -200,7 +210,7 @@ Claude's TUI mode races on a singleton supervisor lock during the first ~1s of b
 
 ### Compatibility
 
-Tested against Claude Code `2.1.186`. The Stop hook reads `last_assistant_message` from stdin — undocumented, could be renamed or removed. If it breaks, the fallback is `transcript_path`. Teammate-aware waiting reads the `background_tasks` array from the Stop payload, available in Claude Code `2.1.145`+; on older versions the array is absent, so the wrapper finalizes on the first Stop as before.
+Tested against Claude Code `2.1.195`. The Stop hook (tmux backend) reads `last_assistant_message` from stdin — undocumented, could be renamed or removed. If it breaks, the fallback is `transcript_path`. Teammate-aware waiting reads the `background_tasks` array from the Stop payload, available in Claude Code `2.1.145`+; on older versions the array is absent, so the wrapper finalizes on the first Stop as before. The subprocess backend depends only on `claude -p --output-format=json`, which is stable.
 
 ### Caveats
 

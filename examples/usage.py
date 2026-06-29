@@ -2,9 +2,10 @@
 """Minimal Python usage: drive claude-pty, parse the JSON envelope.
 
 Intended as the integration template for claude-on-the-fly's claude backend:
-replace its `-p --output-format=json` subprocess call with `claude_pty()` below and
-you gain the statusline subtree (rate_limits, context_window, etc.) without
-changing the call shape.
+replace its `-p --output-format=json` subprocess call with `claude_pty()` below
+without changing the call shape. With an attachable tmux target (set
+CLAUDE_PTY_TMUX_SESSION) you also gain the statusline subtree (rate_limits,
+context_window, etc.); the headless subprocess backend leaves `statusline` null.
 """
 
 from __future__ import annotations
@@ -55,7 +56,7 @@ if __name__ == "__main__":
         prompt=sys.argv[1] if len(sys.argv) > 1 else "Reply with only the word PONG.",
         model="haiku",
     )
-    sl = envelope.get("statusline", {})
+    sl = envelope.get("statusline") or {}  # null in the headless subprocess backend
     print(f"result:        {envelope['result']!r}")
     print(f"cost USD:      {envelope['total_cost_usd']}")
     print(f"duration ms:   {envelope['duration_ms']}")
