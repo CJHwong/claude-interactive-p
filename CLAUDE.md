@@ -1,25 +1,59 @@
 # CLAUDE.md
 
-`claude-pty` runs one `claude` turn headlessly and emits a JSON envelope (a superset of `claude -p --output-format=json`) on stdout when the turn finishes. With an attachable tmux target it drives a real interactive `claude` TUI an operator can `tmux attach` into; otherwise it falls back to a non-attachable subprocess. Pure bash plus `jq`. Do not add other runtime dependencies.
+`claude-pty` runs one `claude` turn under an interactive PTY and emits a JSON
+envelope (a superset of `claude -p --output-format=json`) on stdout when the
+turn finishes. By default it hosts the TUI in a detached tmux session an
+operator can `tmux attach` into; when tmux is unavailable (or
+`CLAUDE_PTY_NO_TMUX=1`) it falls back to a non-attachable `script` PTY. Pure
+bash plus `jq`. Do not add other runtime dependencies.
 
-The README covers usage, env vars, the envelope shape, and the install flow. This file records the things that aren't obvious from reading the code: how the two backends differ, how the turn-done mechanism works, how to debug hook behavior, and how to test changes.
+The README covers usage, env vars, the envelope shape, and install. This file
+records what isn't obvious from the code: how the two backends differ, the
+turn-done mechanism, how to debug hooks, and how to test changes.
 
 ## Backends
 
-The backend is chosen at runtime in `claude-pty`:
+Chosen at runtime in `claude-pty`:
 
-- **tmux** — when `CLAUDE_PTY_TMUX_SESSION` is set and `tmux` is on PATH. Hosts the interactive TUI in a detached tmux session an operator can `tmux attach` into. The only attachable mode, and the only one that uses the Stop-hook envelope mechanism below.
-- **subprocess** — otherwise (or if tmux fails to start). Runs `claude -p --output-format=json` as a plain subprocess. Headless, not attachable.
+- **tmux** (default) — when `tmux` is on PATH and `CLAUDE_PTY_NO_TMUX` is unset.
+  Hosts the TUI in a detached tmux session (name auto-generated if
+  `CLAUDE_PTY_TMUX_SESSION` is unset). The only attachable mode.
+- **script** — when tmux is missing, `CLAUDE_PTY_NO_TMUX=1`, or a tmux launch
+  fails mid-run. Hosts the same interactive TUI under `script`. Not attachable.
 
-Why two backends: claude's TUI only persists its transcript against a real, rendered terminal. tmux provides one even when launched headless; a bare `script`-style PTY launched with no controlling tty gets a 0×0 terminal and the TUI never flushes the transcript, so turns/tool-use/cost are lost. (Verified on 2.1.195: same `script` invocation flushes from inside a tmux pane, not from a tty-less context — it's the terminal, not the kill timing.) The subprocess backend sidesteps the TUI entirely: with no tty, claude runs the turn non-interactively, flushes its transcript, prints the result JSON, and exits on its own. So it's correct headless at the cost of attachability. An earlier `script` fallback was dropped because it can't flush headless.
+Both backends use the Stop-hook + statusline-shim envelope mechanism below; the
+only structural difference is the process host.
 
-## The turn-done mechanism (tmux backend)
+Why tmux is the default: claude only flushes its session transcript against a
+real, rendered terminal. tmux provides one even headless. The `script` PTY does
+**not** when launched with no controlling tty — it gets a 0×0 terminal and the
+transcript never flushes, so the transcript-derived envelope fields
+(`num_turns`, `usage`, `modelUsage`, `uuid`, `stop_reason`) come back `0`/`null`
+(verified on 2.1.195 over 20 headless runs: 0 flushed; the same turn under tmux
+flushes every time). What survives in headless script mode is everything *not*
+from the transcript: `result` (the Stop hook's `last_assistant_message`) and the
+whole `statusline` subtree including `total_cost_usd` (the shim fires on render,
+which happens regardless of terminal size). So script mode is fine with a real
+terminal (a human at a shell) and degraded-but-not-broken headless. It is not a
+guess — emulation completeness (size, controlling tty, VT query responses) was
+tested and does not make the transcript flush; only the tmux process host does.
 
-In interactive mode `claude` does not exit at turn end (the TUI waits for more input), so the wrapper cannot wait on process exit. Instead the `Stop` hook (`hooks/stop_envelope.sh`) writes `$CLAUDE_PTY_ENVELOPE`, and that file appearing is the turn-done signal. `claude-pty` polls for it, waits for background agent work to drain, then reaps the tmux session.
+## The turn-done mechanism
 
-The wrapper owns the kill, not the hook. An older design had the hook `kill $PPID`; that broke when Claude Code started wrapping hook commands in a shell, so `$PPID` became the wrapper rather than `claude`, and the process tree leaked. Keep kill ownership in `claude-pty`, which knows the tmux session. When you change terminate logic, change it in `wait_for_turn_completion`.
+`claude` does not exit at turn end in interactive mode (the TUI waits for more
+input), so the wrapper cannot wait on process exit. Instead the `Stop` hook
+(`hooks/stop_envelope.sh`) writes `$CLAUDE_PTY_ENVELOPE`, and that file appearing
+is the turn-done signal. `claude-pty` polls for it, waits for background agent
+work to drain, then reaps the session (tmux `kill-session`, or SIGTERM/SIGKILL
+of the `script` child tree). This is identical across both backends — both run
+the interactive TUI, so both depend on the Stop hook firing.
 
-The subprocess backend needs none of this: `claude -p` exits on its own at turn end and prints the envelope directly (cost, turns, usage, `terminal_reason`, etc.), so `run_subprocess_mode` just normalizes that JSON to the envelope shape — no hook, no statusline, no kill.
+The wrapper owns the kill, not the hook. An older design had the hook
+`kill $PPID`; that broke when Claude Code started wrapping hook commands in a
+shell, so `$PPID` became the wrapper rather than `claude`, and the process tree
+leaked. Keep kill ownership in `claude-pty`. When you change terminate logic,
+change it in `wait_for_turn_completion` and the per-backend reap in
+`run_claude_pty`.
 
 ## Hooks
 
@@ -44,21 +78,37 @@ To learn what a hook actually receives, capture its raw stdin instead of reasoni
 
 ## Testing changes
 
-Verify with REAL `claude-pty` runs, not unit reasoning. Tests passing is not the same as the feature working. Cover both backends.
+Verify with REAL `claude-pty` runs, not unit reasoning. Tests passing is not the
+same as the feature working. Cover both backends.
 
-Subprocess backend (no `CLAUDE_PTY_TMUX_SESSION`):
+tmux backend (default; tmux on PATH):
 
-- Fast path: a fresh `--session-id` turn that runs a tool finalizes with valid envelope JSON, correct `num_turns`/`total_cost_usd`, and the transcript flushed to `<session_uuid>.jsonl`.
-- Resume: seed a session, then `--resume` a tool turn; assert the transcript grows and `num_turns` reflects it.
-- Error: `--resume` a nonexistent session; assert non-zero exit and a non-empty stderr dump (claude's "No conversation found" must survive — never swallow it). `set -e` will abort before the dump if the `claude` call isn't guarded; keep the `if … then rc=0 else rc=$?` form.
+- Fast path: a fresh turn that runs a tool finalizes with valid envelope JSON,
+  correct `num_turns`/`total_cost_usd`, a populated `statusline` subtree, and the
+  transcript flushed to `<session_uuid>.jsonl`.
+- Drain: spawn a background subagent that does blocking work and writes a marker
+  file, then assert the marker IS written (the teammate was not killed
+  mid-flight) and `terminal_reason` is `"completed"`. Make the inner work
+  blocking inside the subagent, not a detached shell, or you are testing shell
+  draining instead of agent draining.
+- Cap: set `CLAUDE_PTY_TASK_WAIT_SEC` small with a longer-running task, then
+  assert it finalizes near the cap with `terminal_reason: "background_timeout"`.
 
-tmux backend (`CLAUDE_PTY_TMUX_SESSION` set), for terminate-logic changes:
+script backend (`CLAUDE_PTY_NO_TMUX=1`):
 
-- Fast path: a prompt with no background work finalizes promptly with `terminal_reason: "completed"` and a populated `statusline` subtree.
-- Drain: spawn a background subagent that does blocking work and writes a marker file, then assert the marker IS written (proves the teammate was not killed mid-flight) and `terminal_reason` is `"completed"`. Make the inner work blocking inside the subagent, not a detached shell, or you are testing shell draining instead of agent draining.
-- Cap: set `CLAUDE_PTY_TASK_WAIT_SEC` small with a longer-running task, then assert it finalizes near the cap with `terminal_reason: "background_timeout"`.
+- Headless: a turn finalizes with a valid envelope, `terminal_reason: "completed"`,
+  `result` present, `total_cost_usd` and `statusline` present (the shim renders
+  regardless), and `num_turns: 0` / `usage: null` (transcript not flushed). It
+  must NOT hang — the Stop hook still fires. This degraded shape is expected;
+  don't "fix" it by reaching for a subprocess backend (an earlier `claude -p`
+  fallback was removed: it defeats the tool's interactive-recreation purpose).
+- Error: `--resume` a nonexistent session; assert a non-zero exit and that
+  claude's "No conversation found" survives in the stderr dump (never swallow
+  it). The `script` typescript feeds that dump.
 
-After a kill mid-flight, a deeply nested bash grandchild (a subagent's `sleep`, for example) can orphan and run to completion on its own before exiting. That is expected, not a leak.
+After a kill mid-flight, a deeply nested bash grandchild (a subagent's `sleep`,
+for example) can orphan and run to completion on its own before exiting. That is
+expected, not a leak.
 
 ## Constraints
 
