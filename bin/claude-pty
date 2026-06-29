@@ -1,17 +1,21 @@
 #!/usr/bin/env bash
-# claude-pty: run interactive Claude under a PTY, auto-submit a prompt, and
-# emit a JSON envelope on stdout when the turn finishes.
+# claude-pty: run one Claude turn and emit a JSON envelope on stdout when it
+# finishes. Two backends, chosen at runtime (see "Backend selection" below):
+#   - tmux:       attachable interactive TUI; envelope built from the Stop hook
+#                 + statusline shim. The only mode with the statusline subtree.
+#   - subprocess: headless `claude -p --output-format=json`, normalized to the
+#                 same envelope shape (statusline null). Not attachable.
 #
-# Envelope shape: superset of `claude -p --output-format=json`, minus ttft_ms
-# (not surfaced by any hook or statusline channel), plus statusline-exclusive
-# fields (rate_limits, context_window, etc).
+# Envelope shape: superset of `claude -p --output-format=json`. The tmux backend
+# adds statusline-exclusive fields (rate_limits, context_window, etc); the
+# subprocess backend sources the core fields from -p directly.
 #
 # Usage:
 #   claude-pty [claude flags...] "prompt"
 #
-# Reads the same Claude Code config as `claude` itself: default ~/.claude,
-# or override via CLAUDE_CONFIG_DIR. The Stop hook and statusline shim must
-# already be wired into that config (run install.sh once).
+# Reads the same Claude Code config as `claude` itself: default ~/.claude, or
+# override via CLAUDE_CONFIG_DIR. For the tmux backend the Stop hook and
+# statusline shim must already be wired into that config (run install.sh once).
 set -euo pipefail
 
 # A claude-pty call only makes sense when there is something for claude to
@@ -80,11 +84,6 @@ trap cleanup EXIT
 export CLAUDE_PTY_ENVELOPE="$tmp_dir/envelope.json"
 export CLAUDE_PTY_SIDECAR="$tmp_dir/sidecar.json"
 export CLAUDE_PTY_DEBUG_LOG="${CLAUDE_PTY_DEBUG_LOG:-$tmp_dir/debug.log}"
-# Where `script` records claude's PTY session (script-PTY mode). Captured to a
-# file instead of /dev/null so a failure that claude prints to its terminal —
-# e.g. `claude --resume` rejecting a missing session with "No conversation
-# found" — survives for the failure dump below instead of vanishing.
-pty_typescript="$tmp_dir/pty_typescript"
 
 # Serialize ONLY claude's supervisor startup race. Claude's TUI mode races
 # on a singleton supervisor lock during the first ~1s of boot; two TUIs
@@ -215,8 +214,7 @@ agentic_tasks_in_flight() {
   ' "$CLAUDE_PTY_ENVELOPE" > /dev/null 2>&1
 }
 
-# Liveness predicates for the two PTY backends, passed by name to the waiter.
-script_pty_alive()  { kill -0 "${pty_pid:-}" 2>/dev/null; }
+# Liveness predicate for the tmux backend, passed by name to the waiter.
 tmux_session_alive() { tmux has-session -t "${CLAUDE_PTY_TMUX_SESSION:-}" 2>/dev/null; }
 
 # Wait for the turn to truly finish: first for the envelope to appear (visible
@@ -250,86 +248,127 @@ wait_for_turn_completion() {
   done
 }
 
-# Run claude under a PTY, wait for the turn to finish, then terminate claude.
+# Subprocess backend — the non-attachable fallback used when there is no tmux
+# target (or tmux is unavailable). Without a tty claude runs the turn
+# NON-interactively: tools and subagents run inline, it flushes its transcript,
+# prints a JSON result, and EXITS on its own. So none of the interactive
+# scaffolding applies here — no Stop-hook turn-signal, no statusline sidecar, no
+# kill, no agentic-drain wait. `claude -p --output-format=json` already returns
+# the bulk of the envelope (cost, turns, usage, modelUsage, terminal_reason,
+# fast_mode_state, uuid, is_error...), so we just add the few hook/statusline
+# keys it omits and emit one consistent shape.
+#
+# Why this is the fallback and not an interactive PTY: claude's TUI only
+# persists its transcript against a real rendered terminal. tmux provides one; a
+# bare/`script` PTY launched headless (no controlling tty) does not, so the
+# transcript never flushes there. The subprocess path sidesteps the TUI entirely
+# and is therefore correct headless — it just can't be `tmux attach`ed into.
+run_subprocess_mode() {
+  local out="$tmp_dir/subprocess.json" err="$tmp_dir/subprocess_err" rc
+  # Unset the hook env so the global Stop hook no-ops: in -p mode it would only
+  # write an envelope we ignore, after a pointless sidecar wait. The `if` keeps a
+  # non-zero claude exit from tripping `set -e` before we can dump diagnostics.
+  # Redirect stdin from /dev/null: the prompt is a positional arg, and without
+  # this claude -p stalls ~3s per turn waiting for piped stdin that never comes.
+  if env -u CLAUDE_PTY_ENVELOPE -u CLAUDE_PTY_SIDECAR \
+       claude -p --output-format=json "$@" < /dev/null > "$out" 2> "$err"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  if ! jq -e 'type == "object"' < "$out" > /dev/null 2>&1; then
+    {
+      echo "claude-pty: subprocess backend produced no JSON result (claude rc=$rc)"
+      [ -s "$err" ] && { echo "--- claude stderr (tail) ---"; tail -20 "$err"; }
+      [ -s "$out" ] && { echo "--- claude stdout (tail) ---"; tail -c 2000 "$out"; }
+      [ -f "$CLAUDE_PTY_DEBUG_LOG" ] && { echo "--- debug log ---"; cat "$CLAUDE_PTY_DEBUG_LOG"; }
+    } >&2
+    return 1
+  fi
+  # Merge in the hook/statusline-sourced keys the tmux backend carries but -p
+  # omits. Statusline-derived fields (rate_limits, context_window, fast_mode)
+  # have no TUI to come from, so statusline stays null; cost/turns are -p's own.
+  jq '. + {
+    transcript_path: (.transcript_path // null),
+    cwd: (.cwd // env.PWD),
+    permission_mode: (.permission_mode // null),
+    background_tasks: (.background_tasks // []),
+    session_crons: (.session_crons // []),
+    statusline: (.statusline // null)
+  }' < "$out"
+}
+
+# Run claude in a detached tmux session, wait for the turn to finish, then reap
+# the session. Reached only when an attachable tmux backend was selected (see
+# the backend selection below); on a tmux failure it falls back to the
+# subprocess backend so a tmux hiccup never costs a turn (losing only attach).
 #
 # Turn completion is signalled by the Stop hook writing $CLAUDE_PTY_ENVELOPE.
-# claude itself does NOT exit at turn end (the interactive TUI waits for more
-# input), so this launches it in the background, polls for the envelope, and
-# kills it. Version-proof: the old model had the Stop hook `kill $PPID`, which
-# broke once Claude Code started wrapping hook commands in a shell (PPID =
-# wrapper, not claude) — claude survived, this blocked forever, trees leaked
-# as orphans. Owning the kill here means we know the real child pid (and, in
-# tmux mode, the session).
+# claude does NOT exit at turn end (the interactive TUI waits for more input), so
+# we host it in tmux, poll for the envelope, then kill-session. Owning the reap
+# here (vs the old Stop-hook `kill $PPID`) means we know the real session even
+# after Claude Code began wrapping hook commands in a shell.
 #
-# Default PTY: `script` with the rendered TUI thrown at /dev/null. When
-# CLAUDE_PTY_TMUX_SESSION is set and tmux is available, host the PTY in a
-# detached tmux session of that name instead, so an operator can `tmux attach`
-# and watch the live UI.
-#
-# tmux caps a command at a few KB ("command too long"), and both the rendered
-# prompt and a full -e environment blow past that. So we keep the tmux command
-# tiny: a generated launcher script is the only argument. The launcher restores
-# the full environment (sourceable `export -p` dump — so claude resolves the
-# same PATH/credentials it would under `script`), cd's to the workspace, and
-# execs claude with the prompt read from a file. Any tmux failure falls back to
-# the script PTY so a tmux hiccup never costs a turn.
+# tmux caps a command at a few KB ("command too long"), and the rendered prompt
+# plus a full -e environment blow past that, so the only tmux argument is a
+# generated launcher: it restores the environment (sourceable `export -p` dump),
+# cd's to the workspace, and execs claude with the prompt read from a file.
 run_claude_pty() {
-  if [ -n "${CLAUDE_PTY_TMUX_SESSION:-}" ] && command -v tmux > /dev/null 2>&1; then
-    local claude_bin
-    claude_bin=$(command -v claude 2>/dev/null || true)
-    if [ -n "$claude_bin" ]; then
-      local launch="$tmp_dir/launch.sh" promptfile="$tmp_dir/prompt" envfile="$tmp_dir/env.sh"
-      printf '%s' "${!#}" > "$promptfile" # last positional arg is the prompt
-      export -p > "$envfile"              # full env, safely quoted + sourceable
-      {
-        printf '#!/usr/bin/env bash\n'
-        printf '. %q\n' "$envfile"
-        printf 'cd %q 2>/dev/null || true\n' "$PWD"
-        printf 'exec %q' "$claude_bin"
-        local fl
-        for fl in "${@:1:$#-1}"; do printf ' %q' "$fl"; done # flags (all but prompt)
-        printf ' "$(cat %q)"\n' "$promptfile"
-      } > "$launch"
-      chmod +x "$launch"
+  local claude_bin
+  claude_bin=$(command -v claude 2>/dev/null || true)
+  if [ -n "$claude_bin" ]; then
+    local launch="$tmp_dir/launch.sh" promptfile="$tmp_dir/prompt" envfile="$tmp_dir/env.sh"
+    printf '%s' "${!#}" > "$promptfile" # last positional arg is the prompt
+    export -p > "$envfile"              # full env, safely quoted + sourceable
+    {
+      printf '#!/usr/bin/env bash\n'
+      printf '. %q\n' "$envfile"
+      printf 'cd %q 2>/dev/null || true\n' "$PWD"
+      printf 'exec %q' "$claude_bin"
+      local fl
+      for fl in "${@:1:$#-1}"; do printf ' %q' "$fl"; done # flags (all but prompt)
+      printf ' "$(cat %q)"\n' "$promptfile"
+    } > "$launch"
+    chmod +x "$launch"
+    tmux kill-session -t "$CLAUDE_PTY_TMUX_SESSION" 2>/dev/null || true
+    if tmux new-session -d -c "$PWD" -s "$CLAUDE_PTY_TMUX_SESSION" "$launch" 2> "$tmp_dir/tmux_err"; then
+      pty_log "tmux session live: tmux attach -t $CLAUDE_PTY_TMUX_SESSION"
+      # Wait for the turn to finish (envelope written + agentic background work
+      # drained), or for claude to crash (session vanishes).
+      wait_for_turn_completion tmux_session_alive
+      # Snapshot the pane's last screen before reaping it, so a resume error or
+      # crash message claude printed survives in the debug log instead of dying
+      # with the session (tmux mode has no typescript file).
+      pty_log "final pane: $(tmux capture-pane -p -t "$CLAUDE_PTY_TMUX_SESSION" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -5 | tr '\n' '|')"
+      # kill-session reaps the pane's claude — no orphan, no $PPID guesswork.
       tmux kill-session -t "$CLAUDE_PTY_TMUX_SESSION" 2>/dev/null || true
-      if tmux new-session -d -c "$PWD" -s "$CLAUDE_PTY_TMUX_SESSION" "$launch" 2> "$tmp_dir/tmux_err"; then
-        pty_log "tmux session live: tmux attach -t $CLAUDE_PTY_TMUX_SESSION"
-        # Wait for the turn to finish (envelope written + agentic background
-        # work drained), or for claude to crash (session vanishes).
-        wait_for_turn_completion tmux_session_alive
-        # Snapshot the pane's last screen before reaping it, so a resume error
-        # or crash message claude printed survives in the debug log instead of
-        # dying with the session (tmux mode has no typescript file).
-        pty_log "final pane: $(tmux capture-pane -p -t "$CLAUDE_PTY_TMUX_SESSION" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -5 | tr '\n' '|')"
-        # kill-session reaps the pane's claude — no orphan, no $PPID guesswork.
-        tmux kill-session -t "$CLAUDE_PTY_TMUX_SESSION" 2>/dev/null || true
-        pty_log "tmux session closed"
-        return 0
-      fi
-      pty_log "tmux new-session failed ($(tr -d '\n' < "$tmp_dir/tmux_err" 2>/dev/null)); falling back to script PTY"
-    else
-      pty_log "claude not on PATH for tmux exec; falling back to script PTY"
+      pty_log "tmux session closed"
+      return 0
     fi
+    pty_log "tmux new-session failed ($(tr -d '\n' < "$tmp_dir/tmux_err" 2>/dev/null)); falling back to subprocess backend"
+  else
+    pty_log "claude not on PATH for tmux exec; falling back to subprocess backend"
   fi
-
-  # script PTY, backgrounded so we can poll for the envelope and then kill the
-  # claude it spawned (script's direct child). TERM then KILL guarantees exit
-  # even if claude ignores TERM; killing claude makes `script` exit too.
-  # The typescript goes to a file (not /dev/null) so claude's own terminal
-  # output is recoverable when no envelope is produced (see the failure dump).
-  script -q "$pty_typescript" claude "$@" > /dev/null 2>&1 &
-  pty_pid=$!   # global (not local) so script_pty_alive can read it by name
-  wait_for_turn_completion script_pty_alive
-  local kid
-  for kid in $(pgrep -P "$pty_pid" 2>/dev/null); do kill -TERM "$kid" 2>/dev/null || true; done
-  kill -TERM "$pty_pid" 2>/dev/null || true
-  sleep 0.3
-  for kid in $(pgrep -P "$pty_pid" 2>/dev/null); do kill -KILL "$kid" 2>/dev/null || true; done
-  kill -KILL "$pty_pid" 2>/dev/null || true
-  wait "$pty_pid" 2>/dev/null || true
-  pty_log "script PTY terminated"
-  return 0
+  # No attachable session possible. Emit the subprocess envelope and exit — the
+  # tmux-mode enrichment below doesn't apply to a -p result.
+  run_subprocess_mode "$@"
+  exit $?
 }
+
+# Backend selection. An attachable interactive session needs a tmux target, so
+# with one (and tmux available) we use the tmux backend. Otherwise the
+# subprocess backend: headless and NOT attachable, but it flushes the transcript
+# and reports cost/turns directly. The interactive PTY can't flush headless —
+# claude's TUI only persists against a real rendered terminal, which tmux
+# provides and a bare/`script` PTY does not. The subprocess backend exits on its
+# own, so it needs none of the lock / envelope / kill machinery below.
+if [ -z "${CLAUDE_PTY_TMUX_SESSION:-}" ] || ! command -v tmux > /dev/null 2>&1; then
+  set +e
+  run_subprocess_mode "$@"
+  rc=$?
+  set -e
+  exit "$rc"
+fi
 
 acquire_startup_lock
 if [ "${CLAUDE_PTY_NO_LOCK:-0}" != "1" ]; then
@@ -356,24 +395,9 @@ fi
 if [ ! -f "$CLAUDE_PTY_ENVELOPE" ]; then
   {
     echo "claude-pty: no envelope produced (claude rc=$rc)"
-    # claude's own terminal output usually names the cause (e.g. a resume of a
-    # missing/empty session prints "No conversation found"). Strip ANSI/CR so
-    # it's readable rather than buried in TUI escapes. Script-PTY mode only;
-    # tmux mode leaves its final pane in the debug log instead.
-    if [ -s "$pty_typescript" ]; then
-      echo "--- claude output (tail) ---"
-      # Strip CSI (incl. private <>=? params), OSC (BEL- *and* ST/ESC-\\-
-      # terminated), and charset-select escapes, then drop any remaining control
-      # bytes (keep tab/newline) so leftover escape fragments and echoed ^D
-      # don't clutter the message. Trailing `|| true` is load-bearing: under the
-      # active `set -e`/`pipefail`, a stage exiting non-zero (e.g. grep matching
-      # nothing, or a SIGPIPE) would otherwise abort this block and skip the
-      # debug-log dump below — the opposite of diagnosing the failure.
-      tail -c 4000 "$pty_typescript" \
-        | LC_ALL=C sed $'s/\x1b\\[[0-9;?<>=]*[a-zA-Z]//g; s/\x1b\\][^\x1b\x07]*\x1b\\\\//g; s/\x1b\\][^\x07]*\x07//g; s/\x1b[()][0-9A-Za-z]//g' \
-        | LC_ALL=C tr -d '\000-\010\013-\037' \
-        | grep -v '^[[:space:]]*$' | tail -20 || true
-    fi
+    # tmux mode keeps no typescript; run_claude_pty captures the final pane and
+    # its trace into the debug log, which usually names the cause — e.g. a resume
+    # of a missing/empty session printing "No conversation found".
     [ -f "$CLAUDE_PTY_DEBUG_LOG" ] && { echo "--- debug log ---"; cat "$CLAUDE_PTY_DEBUG_LOG"; }
   } >&2
   exit 1
