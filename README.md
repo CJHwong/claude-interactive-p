@@ -93,6 +93,7 @@ Superset of `claude -p --output-format=json`. Every `-p` key is present, plus:
 | `duration_api_ms` | statusline `cost.total_api_duration_ms` |
 | `fast_mode_state` | `on`/`off` from statusline |
 | `terminal_reason` | `completed`, or `background_timeout` if the background-task wait cap fired |
+| `compact` | PostCompact hook, on a manual `/compact` only: `{ result, trigger }` |
 
 Always-null stubs: `ttft_ms`, `api_error_status`. Always present:
 `permission_denials` (`[]`), `is_error` (`false`).
@@ -128,9 +129,33 @@ exit. Three pieces cooperate per turn:
 3. **`hooks/stop_envelope.sh`** fires on `Stop`, merges the Stop payload with
    the sidecar into the envelope, and writes it. The envelope appearing is the
    turn-done signal.
+4. **`hooks/postcompact_envelope.sh`** covers the one turn that fires no `Stop`
+   (see [Compaction](#compaction)).
 
-Without the `CLAUDE_PTY_*` env vars both hooks no-op, so they're safe to leave
-installed in your real config.
+Without the `CLAUDE_PTY_*` env vars all three hooks no-op, so they're safe to
+leave installed in your real config.
+
+### Compaction
+
+`/compact` is the one prompt that produces no assistant message, so it fires no
+`Stop` hook — and with only the Stop writer, `claude-pty --resume <id> "/compact"`
+compacts and then hangs: no envelope, and claude's TUI never exits on its own.
+`hooks/postcompact_envelope.sh` writes the envelope from the `PostCompact`
+payload instead, so the run finishes normally.
+
+It writes **only** for `trigger: "manual"`. Claude Code also compacts on its own
+when a conversation outgrows the window, mid-turn, arriving as `trigger: "auto"`
+while the real turn is still running — an envelope there would end the turn early
+and hand back the compaction summary in place of the answer. Anything other than
+`"manual"` is left alone, so an unrecognized trigger degrades to a normal turn
+rather than a truncated one.
+
+The compaction envelope carries `result` (the summary) and
+`compact: { result, trigger }`, and deliberately **no** `statusline`: the sidecar
+holds the last tick, a compaction may produce none, and reporting a stale
+pre-compaction context reading is worse than reporting none. Token counts aren't
+in the envelope either — they belong to the transcript's `compact_boundary`
+record (`preTokens` / `postTokens` / `durationMs`), which is authoritative.
 
 ### Background work
 
@@ -146,6 +171,8 @@ the envelope is finalized with `terminal_reason: background_timeout`.
 Tested against Claude Code `2.1.195`. The Stop hook reads
 `last_assistant_message` (undocumented; falls back to `transcript_path`).
 Background-task waiting reads `background_tasks`, available in `2.1.145`+.
+The compaction hook reads `PostCompact`'s `trigger` and `compact_summary`,
+verified against `2.1.220`.
 
 ## License
 

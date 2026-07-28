@@ -9,6 +9,7 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 SHIM="$REPO_DIR/hooks/statusline.sh"
 STOP="$REPO_DIR/hooks/stop_envelope.sh"
+POSTCOMPACT="$REPO_DIR/hooks/postcompact_envelope.sh"
 
 CFG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 SETTINGS="$CFG_DIR/settings.json"
@@ -33,6 +34,7 @@ fi
 updated=$(jq \
   --arg shim "$SHIM" \
   --arg stop "$STOP" \
+  --arg postcompact "$POSTCOMPACT" \
   --arg prior "$prior_sl" '
     if .statusLine.command == $shim then
       if ($prior | length) > 0
@@ -43,6 +45,8 @@ updated=$(jq \
   | if .hooks then
       .hooks.Stop = ((.hooks.Stop // []) | map(select((.hooks // []) | all(.command != $stop))))
       | if (.hooks.Stop | length == 0) then del(.hooks.Stop) else . end
+      | .hooks.PostCompact = ((.hooks.PostCompact // []) | map(select((.hooks // []) | all(.command != $postcompact))))
+      | if (.hooks.PostCompact | length == 0) then del(.hooks.PostCompact) else . end
       | if (.hooks | length == 0) then del(.hooks) else . end
     else .
     end
