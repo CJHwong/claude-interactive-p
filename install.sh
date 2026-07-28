@@ -50,14 +50,15 @@ if [ -z "$SCRIPT_DIR" ] || [ ! -f "$SCRIPT_DIR/hooks/statusline.sh" ]; then
   mkdir -p "$TARGET/bin" "$TARGET/hooks"
 
   # Files actually needed at runtime. Examples/ stay on GitHub.
-  for rel in install.sh uninstall.sh bin/claude-pty hooks/statusline.sh hooks/stop_envelope.sh; do
+  for rel in install.sh uninstall.sh bin/claude-pty hooks/statusline.sh hooks/stop_envelope.sh hooks/postcompact_envelope.sh; do
     echo "  fetching $rel"
     curl -fsSL "$RAW_BASE/$rel" -o "$TARGET/$rel"
   done
 
   chmod +x "$TARGET/install.sh" "$TARGET/uninstall.sh" \
            "$TARGET/bin/claude-pty" \
-           "$TARGET/hooks/statusline.sh" "$TARGET/hooks/stop_envelope.sh"
+           "$TARGET/hooks/statusline.sh" "$TARGET/hooks/stop_envelope.sh" \
+           "$TARGET/hooks/postcompact_envelope.sh"
 
   exec "$TARGET/install.sh" "$@"
 fi
@@ -66,6 +67,10 @@ fi
 REPO_DIR="$SCRIPT_DIR"
 SHIM="$REPO_DIR/hooks/statusline.sh"
 STOP="$REPO_DIR/hooks/stop_envelope.sh"
+# Writes the envelope for a manual /compact, which fires no Stop hook and would
+# otherwise hang the run. See the header of the script for why it is gated on
+# trigger == "manual".
+POSTCOMPACT="$REPO_DIR/hooks/postcompact_envelope.sh"
 
 # When 0, leave statusLine.command alone and install only the Stop hook.
 WIRE_STATUSLINE=1
@@ -77,6 +82,7 @@ SETTINGS="$CFG_DIR/settings.json"
 command -v jq >/dev/null 2>&1 || { echo "install.sh: jq is required" >&2; exit 1; }
 [ "$WIRE_STATUSLINE" = "1" ] && { [ -x "$SHIM" ] || { echo "install.sh: $SHIM is not executable" >&2; exit 1; }; }
 [ -x "$STOP" ] || { echo "install.sh: $STOP is not executable" >&2; exit 1; }
+[ -x "$POSTCOMPACT" ] || { echo "install.sh: $POSTCOMPACT is not executable" >&2; exit 1; }
 
 mkdir -p "$CFG_DIR"
 if [ ! -f "$SETTINGS" ]; then
@@ -101,6 +107,7 @@ else
   echo "  - leave .statusLine.command untouched (CLAUDE_PTY_NO_STATUSLINE=1)"
 fi
 echo "  - append Stop hook to .hooks.Stop[] (deduped)"
+echo "  - append PostCompact hook to .hooks.PostCompact[] (deduped)"
 echo
 
 if [ -z "${CLAUDE_PTY_YES:-}" ] && [ -e /dev/tty ]; then
@@ -146,7 +153,8 @@ if [ "$WIRE_STATUSLINE" = "1" ]; then
   fi
   updated=$(jq \
     --arg shim "$SHIM" \
-    --arg stop "$STOP" '
+    --arg stop "$STOP" \
+    --arg postcompact "$POSTCOMPACT" '
       .statusLine = { type: "command", command: $shim }
     | .hooks = (.hooks // {})
     | .hooks.Stop = (
@@ -155,16 +163,29 @@ if [ "$WIRE_STATUSLINE" = "1" ]; then
           | map(select((.hooks // []) | length > 0)))
         + [ { hooks: [ { type: "command", command: $stop } ] } ]
       )
+    | .hooks.PostCompact = (
+        ((.hooks.PostCompact // [])
+          | map(.hooks = ((.hooks // []) | map(select(.command != $postcompact))))
+          | map(select((.hooks // []) | length > 0)))
+        + [ { hooks: [ { type: "command", command: $postcompact } ] } ]
+      )
   ' "$SETTINGS")
 else
   updated=$(jq \
-    --arg stop "$STOP" '
+    --arg stop "$STOP" \
+    --arg postcompact "$POSTCOMPACT" '
       .hooks = (.hooks // {})
     | .hooks.Stop = (
         ((.hooks.Stop // [])
           | map(.hooks = ((.hooks // []) | map(select(.command != $stop))))
           | map(select((.hooks // []) | length > 0)))
         + [ { hooks: [ { type: "command", command: $stop } ] } ]
+      )
+    | .hooks.PostCompact = (
+        ((.hooks.PostCompact // [])
+          | map(.hooks = ((.hooks // []) | map(select(.command != $postcompact))))
+          | map(select((.hooks // []) | length > 0)))
+        + [ { hooks: [ { type: "command", command: $postcompact } ] } ]
       )
   ' "$SETTINGS")
 fi
