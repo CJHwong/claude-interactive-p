@@ -67,6 +67,32 @@ Read it before touching anything hook-related. Do not guess payload field names 
 - A finished `subagent`/`teammate`/`workflow` wakes the orchestrator and produces a fresh `Stop` with that task dropped. A finished background `shell` does NOT wake the session, so it never produces a draining `Stop`. This asymmetry is why `claude-pty` awaits agentic task types only and relies on a wall-clock cap (`CLAUDE_PTY_TASK_WAIT_SEC`) for everything else.
 - `Stop`/`SubagentStop` include `agent_id`/`agent_type` only inside a subagent context. On a main-agent `Stop` they are null, so the payload itself tells you which kind of stop it is.
 
+## The statusline sidecar is the only source of the live fields
+
+`rate_limits`, `context_window` and `fast_mode` reach nobody through claude's own
+output — they exist only in the statusline payload, which `hooks/statusline.sh`
+rewrites to `$CLAUDE_PTY_SIDECAR` (tmp + `mv`, so a reader never sees a partial
+file) on every tick. The Stop hook then folds that file into the envelope
+wholesale as `statusline`, which is why `envelope.statusline.rate_limits` and the
+sidecar's own bytes are the same thing.
+
+That fold happens only at a **clean turn end**, and the default sidecar path is
+inside the wrapper's `$tmp_dir`, which `cleanup` deletes on EXIT. So a caller
+killed mid-turn loses every reading the turn produced — the file is deleted
+seconds after the last write, having never been read. `CLAUDE_PTY_SIDECAR` is
+overridable for exactly that case: point it somewhere the caller owns and the
+live fields become readable without a turn boundary, with no Stop hook and no
+process exit involved.
+
+Two consequences worth keeping in mind when changing this:
+
+- A caller-supplied path **persists across turns**, so "the sidecar exists" no
+  longer means "our claude has started". Anything keying on the sidecar must wait
+  for its mtime to *advance* past a snapshot — `release_lock_after_startup` and
+  the Stop hook both do. Testing existence would match the previous turn's file.
+- The wrapper never deletes an inbound path. Its lifetime belongs to the caller,
+  and a stale one is a stale *reading*, which is the caller's problem to date.
+
 ## Debugging hook behavior
 
 To learn what a hook actually receives, capture its raw stdin instead of reasoning about it.

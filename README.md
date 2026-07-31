@@ -108,6 +108,7 @@ Always-null stubs: `ttft_ms`, `api_error_status`. Always present:
 | `CLAUDE_PTY_NO_LOCK` | unset | `1` skips startup serialization (set when the caller guarantees serial startup) |
 | `CLAUDE_PTY_TASK_WAIT_SEC` | `5400` | Max seconds to keep claude alive draining background subagents/teammates |
 | `CLAUDE_PTY_DEBUG_LOG` | unset | File path for the wrapper + Stop-hook debug log |
+| `CLAUDE_PTY_SIDECAR` | temp dir | File path for the statusline sidecar. Set it to read live `rate_limits` / `context_window` mid-turn, or after a turn the wrapper never finished |
 | `CLAUDE_INTERACTIVE_P_HOME` | `~/.local/share/claude-interactive-p` | Where the curl bootstrap drops runtime files |
 
 Install-time: `CLAUDE_PTY_NO_STATUSLINE=1` skips wiring the statusline shim
