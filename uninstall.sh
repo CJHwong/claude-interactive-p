@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
-# Reverse install.sh: remove the claude-pty statusLine + Stop hook from settings.json.
+# Reverse install.sh: remove the claude-pty statusLine, Stop hook and PostCompact
+# hook from settings.json.
 # Leaves a backup and prints any prior statusLine.command you may want to
 # restore manually.
 #
@@ -43,9 +44,18 @@ updated=$(jq \
       end
     else . end
   | if .hooks then
-      .hooks.Stop = ((.hooks.Stop // []) | map(select((.hooks // []) | all(.command != $stop))))
+      # Strip OUR hook out of each matcher group, then drop only the groups left
+      # empty. Selecting whole groups by `all(.command != ...)` deleted an entire
+      # group when it also held hooks the operator added, so uninstalling us took
+      # those with it. This mirrors the nested form in install.sh, which is what
+      # makes an install/uninstall round-trip leave a co-located hook intact.
+      .hooks.Stop = ((.hooks.Stop // [])
+        | map(.hooks = ((.hooks // []) | map(select(.command != $stop))))
+        | map(select((.hooks // []) | length > 0)))
       | if (.hooks.Stop | length == 0) then del(.hooks.Stop) else . end
-      | .hooks.PostCompact = ((.hooks.PostCompact // []) | map(select((.hooks // []) | all(.command != $postcompact))))
+      | .hooks.PostCompact = ((.hooks.PostCompact // [])
+        | map(.hooks = ((.hooks // []) | map(select(.command != $postcompact))))
+        | map(select((.hooks // []) | length > 0)))
       | if (.hooks.PostCompact | length == 0) then del(.hooks.PostCompact) else . end
       | if (.hooks | length == 0) then del(.hooks) else . end
     else .

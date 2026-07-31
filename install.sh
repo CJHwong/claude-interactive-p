@@ -25,11 +25,12 @@
 #                                 Default: CJHwong/claude-interactive-p
 #   CLAUDE_INTERACTIVE_P_REF      branch/tag/sha to fetch from raw.gh in curl
 #                                 mode. Default: main
-#   CLAUDE_PTY_NO_STATUSLINE     when 1, skip wiring statusLine.command — only
-#                                 the Stop hook is installed. For callers that
-#                                 don't consume the statusline subtree (and that
-#                                 serialize startup themselves, since without the
-#                                 shim the lock's release signal never arrives).
+#   CLAUDE_PTY_NO_STATUSLINE     when 1, skip wiring statusLine.command. Both
+#                                 the Stop and PostCompact hooks are still
+#                                 installed. For callers that don't consume the
+#                                 statusline subtree (and that serialize startup
+#                                 themselves, since without the shim the lock's
+#                                 release signal never arrives).
 #
 set -euo pipefail
 
