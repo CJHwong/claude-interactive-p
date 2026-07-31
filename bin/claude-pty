@@ -350,9 +350,47 @@ run_claude_pty() {
   # even if claude ignores TERM; killing claude makes `script` exit too. The
   # typescript goes to a file (not /dev/null) so claude's own terminal output is
   # recoverable when no envelope is produced (see the failure dump).
-  script -q "$pty_typescript" claude "$@" > /dev/null 2>&1 &
+  #
+  # The two `script` implementations take the command in incompatible ways and
+  # each REJECTS the other's form, so this has to branch or it fails outright on
+  # one of them. Measured:
+  #
+  #                        trailing cmd   -- cmd   -c "cmd"
+  #   BSD (macOS)              works        n/a      fails
+  #   util-linux 2.39.3        fails       fails     works
+  #   util-linux 2.41          fails       fails     works
+  #
+  # Note the `--` form does NOT work despite util-linux's own man page listing
+  # `script [options] [file] [-- command]`: with the file given positionally,
+  # both versions tested still exit "unexpected number of arguments".
+  #
+  # Branch on a feature probe rather than parsing `script --version`, so a third
+  # implementation (busybox, a BSD variant) is classified by what it accepts
+  # instead of by whether we recognise its version banner. `-c` needs one string,
+  # so the argv is re-quoted with %q; the trailing form takes argv as-is.
+  if script -q /dev/null -c true > /dev/null 2>&1; then
+    local quoted_cmd
+    quoted_cmd=$(printf '%q ' claude "$@")
+    script -q "$pty_typescript" -c "$quoted_cmd" > /dev/null 2>&1 &
+  else
+    script -q "$pty_typescript" claude "$@" > /dev/null 2>&1 &
+  fi
   pty_pid=$!   # global (not local) so script_pty_alive can read it by name
   wait_for_turn_completion script_pty_alive
+  # Claude exited on its own — no envelope, and the waiter gave up because the
+  # process vanished rather than because a turn finished. Reap it here and hand
+  # the real status back: this is the ONE point where claude's own exit code is
+  # observable, and the no-envelope message quotes it. `--resume` against a
+  # missing session is the common case (prints "No conversation found", exits 1);
+  # reporting rc=0 for it points the operator away from claude. Past the signals
+  # below the status is OUR signal, not claude's, and says nothing.
+  local pty_rc=0
+  if ! script_pty_alive; then
+    wait "$pty_pid" 2>/dev/null
+    pty_rc=$?
+    pty_log "script PTY exited on its own (rc=$pty_rc)"
+    return "$pty_rc"
+  fi
   local kid
   for kid in $(pgrep -P "$pty_pid" 2>/dev/null); do kill -TERM "$kid" 2>/dev/null || true; done
   kill -TERM "$pty_pid" 2>/dev/null || true
@@ -388,7 +426,15 @@ fi
 
 if [ ! -f "$CLAUDE_PTY_ENVELOPE" ]; then
   {
-    echo "claude-pty: no envelope produced (claude rc=$rc)"
+    # Only claim a claude exit code when we actually observed one. rc is 0 both
+    # when claude exited 0 and when we terminated it ourselves (tmux mode never
+    # yields claude's status at all), so printing "rc=0" for the latter reads as
+    # a clean exit and sends the reader looking in the wrong place.
+    if [ "$rc" -ne 0 ]; then
+      echo "claude-pty: no envelope produced (claude rc=$rc)"
+    else
+      echo "claude-pty: no envelope produced (claude did not report an exit code)"
+    fi
     # claude's own terminal output usually names the cause (e.g. a resume of a
     # missing/empty session prints "No conversation found"). Strip ANSI/CR so
     # it's readable rather than buried in TUI escapes. script backend only; tmux
