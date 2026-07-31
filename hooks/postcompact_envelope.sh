@@ -50,6 +50,15 @@ fi
 # token counts are not here on purpose: they live in the transcript's
 # `compact_boundary` record, which is authoritative and which the consumer is
 # already reading the session file for.
+#
+# `background_tasks` is passed through, NOT hardcoded empty. It is the only
+# signal that keeps a session alive while agentic work runs: the wrapper reads
+# this array out of the envelope, so an empty one makes `wait_for_turn_completion`
+# return at once and reap the session. A manual /compact issued while a subagent
+# or teammate was running therefore killed it, and the envelope still claimed
+# `subtype: "success"`. `permission_mode` and `session_crons` ride along for the
+# same reason `stop_envelope.sh` carries them — a consumer reads one shape in
+# either mode, and a field silently absent here is a field it has to special-case.
 envelope=$(jq -n \
   --argjson post "$input" '
   {
@@ -59,8 +68,10 @@ envelope=$(jq -n \
     session_id: $post.session_id,
     transcript_path: $post.transcript_path,
     cwd: $post.cwd,
+    permission_mode: $post.permission_mode,
     result: ($post.compact_summary // ""),
-    background_tasks: [],
+    background_tasks: ($post.background_tasks // []),
+    session_crons: ($post.session_crons // []),
     compact: { result: "success", trigger: $post.trigger },
     statusline: {}
   }
