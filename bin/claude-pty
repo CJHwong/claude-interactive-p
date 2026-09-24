@@ -99,11 +99,14 @@ export CLAUDE_PTY_ENVELOPE="$tmp_dir/envelope.json"
 export CLAUDE_PTY_SIDECAR="${CLAUDE_PTY_SIDECAR:-$tmp_dir/sidecar.json}"
 export CLAUDE_PTY_DEBUG_LOG="${CLAUDE_PTY_DEBUG_LOG:-$tmp_dir/debug.log}"
 
-# Epoch mtime of the sidecar, or 0 when it isn't there. BSD stat first, then
-# GNU, so this works on macOS and Linux. Mirrors the Stop hook's helper.
+# Epoch mtime of the sidecar, or 0 when it isn't there. Mirrors the Stop hook's
+# helper. GNU form first: GNU `stat -f` means "show the file system", so on a Mac
+# with GNU coreutils first on PATH the BSD form prints a block of text and exits
+# non-zero, and the fallback appends the number to it. BSD stat rejects `-c`
+# without printing to stdout, so a stock Mac still reaches the BSD form.
 sidecar_mtime() {
-  stat -f %m "$CLAUDE_PTY_SIDECAR" 2>/dev/null \
-    || stat -c %Y "$CLAUDE_PTY_SIDECAR" 2>/dev/null \
+  stat -c %Y "$CLAUDE_PTY_SIDECAR" 2>/dev/null \
+    || stat -f %m "$CLAUDE_PTY_SIDECAR" 2>/dev/null \
     || echo 0
 }
 # Where `script` records claude's PTY session (script backend). Captured to a

@@ -32,9 +32,10 @@ fi
 # second as the hook start would falsely match on the first check.
 sidecar='{}'
 if [ -n "${CLAUDE_PTY_SIDECAR:-}" ]; then
+  # GNU form first; see sidecar_mtime in bin/claude-pty for why the order matters.
   sidecar_mtime() {
-    stat -f %m "$CLAUDE_PTY_SIDECAR" 2>/dev/null \
-      || stat -c %Y "$CLAUDE_PTY_SIDECAR" 2>/dev/null \
+    stat -c %Y "$CLAUDE_PTY_SIDECAR" 2>/dev/null \
+      || stat -f %m "$CLAUDE_PTY_SIDECAR" 2>/dev/null \
       || echo 0
   }
   prev_mtime=$(sidecar_mtime)
