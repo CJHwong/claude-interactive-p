@@ -255,7 +255,14 @@ agentic_tasks_in_flight() {
 
 # Liveness predicates for the two backends, passed by name to the waiter.
 script_pty_alive()   { kill -0 "${pty_pid:-}" 2>/dev/null; }
-tmux_session_alive() { tmux has-session -t "${CLAUDE_PTY_TMUX_SESSION:-}" 2>/dev/null; }
+tmux_session_alive() { tmux has-session -t "${tmux_session_id:-}" 2>/dev/null; }
+
+abort_if_tmux_session_exists() {
+  if tmux has-session -t "=${CLAUDE_PTY_TMUX_SESSION}" 2>/dev/null; then
+    echo "claude-pty: tmux session '$CLAUDE_PTY_TMUX_SESSION' already exists; refusing to replace it" >&2
+    exit 1
+  fi
+}
 
 # Wait for the turn to truly finish: first for the envelope to appear (visible
 # turn ended), then for any agentic background work to drain. $1 is the name of
@@ -327,8 +334,12 @@ run_claude_pty() {
         printf ' "$(cat %q)"\n' "$promptfile"
       } > "$launch"
       chmod +x "$launch"
-      tmux kill-session -t "$CLAUDE_PTY_TMUX_SESSION" 2>/dev/null || true
-      if tmux new-session -d -c "$PWD" -s "$CLAUDE_PTY_TMUX_SESSION" "$launch" 2> "$tmp_dir/tmux_err"; then
+      # An inherited session name can belong to the caller's own live pane.
+      # Never replace it. new-session claims the name atomically; retain its
+      # immutable id so cleanup cannot kill a later session reusing the name.
+      abort_if_tmux_session_exists
+      local tmux_session_id=""
+      if tmux_session_id=$(tmux new-session -d -P -F '#{session_id}' -c "$PWD" -s "$CLAUDE_PTY_TMUX_SESSION" "$launch" 2> "$tmp_dir/tmux_err"); then
         pty_log "tmux session live: tmux attach -t $CLAUDE_PTY_TMUX_SESSION"
         # Wait for the turn to finish (envelope written + agentic background
         # work drained), or for claude to crash (session vanishes).
@@ -336,12 +347,14 @@ run_claude_pty() {
         # Snapshot the pane's last screen before reaping it, so a resume error
         # or crash message claude printed survives in the debug log instead of
         # dying with the session (tmux mode has no typescript file).
-        pty_log "final pane: $(tmux capture-pane -p -t "$CLAUDE_PTY_TMUX_SESSION" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -5 | tr '\n' '|')"
+        pty_log "final pane: $(tmux capture-pane -p -t "$tmux_session_id" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -5 | tr '\n' '|')"
         # kill-session reaps the pane's claude — no orphan, no $PPID guesswork.
-        tmux kill-session -t "$CLAUDE_PTY_TMUX_SESSION" 2>/dev/null || true
+        tmux kill-session -t "$tmux_session_id" 2>/dev/null || true
         pty_log "tmux session closed"
         return 0
       fi
+      # A sibling may have claimed the name between our check and new-session.
+      abort_if_tmux_session_exists
       pty_log "tmux new-session failed ($(tr -d '\n' < "$tmp_dir/tmux_err" 2>/dev/null)); falling back to script PTY"
     else
       pty_log "claude not on PATH for tmux exec; falling back to script PTY"
