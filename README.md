@@ -60,7 +60,9 @@ Chosen at runtime:
 tmux is used whenever it's installed; if you don't set
 `CLAUDE_PTY_TMUX_SESSION`, a session name is generated (and logged, so the run
 is still attachable). A tmux failure mid-run falls back to script so a hiccup
-never costs a turn.
+never costs a turn. If the requested session name is already live, `claude-pty`
+exits with an error and leaves that session running. Set a different name or
+unset `CLAUDE_PTY_TMUX_SESSION` for an automatically generated one.
 
 ### No-tmux mode
 

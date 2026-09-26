@@ -17,7 +17,9 @@ Chosen at runtime in `claude-pty`:
 
 - **tmux** (default) — when `tmux` is on PATH and `CLAUDE_PTY_NO_TMUX` is unset.
   Hosts the TUI in a detached tmux session (name auto-generated if
-  `CLAUDE_PTY_TMUX_SESSION` is unset). The only attachable mode.
+  `CLAUDE_PTY_TMUX_SESSION` is unset). The only attachable mode. An occupied
+  session name is an error, never a session to replace; cleanup targets the
+  session id created by this invocation.
 - **script** — when tmux is missing, `CLAUDE_PTY_NO_TMUX=1`, or a tmux launch
   fails mid-run. Hosts the same interactive TUI under `script`. Not attachable.
 
