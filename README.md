@@ -175,6 +175,11 @@ claude's message in `result` and its category in `error`. That matches what
 `claude -p --output-format=json` reports for the same failure, except that the
 hook payload carries no HTTP status, so `api_error_status` stays null.
 
+A failure while the wrapper waits on background work keeps that wait, so a
+later clean Stop can still finish it. `authentication_failed` is the exception:
+no later turn can get past a broken login, so the hook clears the task list and
+the run ends.
+
 "Not logged in" (no credential at all) is a local check that fires no hook, so
 it still hangs to the caller's timeout.
 
