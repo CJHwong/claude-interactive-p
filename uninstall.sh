@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# Reverse install.sh: remove the claude-pty statusLine, Stop hook and PostCompact
-# hook from settings.json.
+# Reverse install.sh: remove the claude-pty statusLine, Stop hook, PostCompact
+# hook and StopFailure hook from settings.json.
 # Leaves a backup and prints any prior statusLine.command you may want to
 # restore manually.
 #
@@ -11,6 +11,7 @@ REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 SHIM="$REPO_DIR/hooks/statusline.sh"
 STOP="$REPO_DIR/hooks/stop_envelope.sh"
 POSTCOMPACT="$REPO_DIR/hooks/postcompact_envelope.sh"
+STOPFAILURE="$REPO_DIR/hooks/stopfailure_envelope.sh"
 
 CFG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 SETTINGS="$CFG_DIR/settings.json"
@@ -30,12 +31,13 @@ if [ -f "$PRIOR_STATUSLINE_FILE" ]; then
   prior_sl=$(cat "$PRIOR_STATUSLINE_FILE")
 fi
 
-# Drop or restore the statusLine; drop the claude-pty Stop hook entry. Other hooks
+# Drop or restore the statusLine; drop the claude-pty hook entries. Other hooks
 # and settings keys are untouched.
 updated=$(jq \
   --arg shim "$SHIM" \
   --arg stop "$STOP" \
   --arg postcompact "$POSTCOMPACT" \
+  --arg stopfailure "$STOPFAILURE" \
   --arg prior "$prior_sl" '
     if .statusLine.command == $shim then
       if ($prior | length) > 0
@@ -57,6 +59,10 @@ updated=$(jq \
         | map(.hooks = ((.hooks // []) | map(select(.command != $postcompact))))
         | map(select((.hooks // []) | length > 0)))
       | if (.hooks.PostCompact | length == 0) then del(.hooks.PostCompact) else . end
+      | .hooks.StopFailure = ((.hooks.StopFailure // [])
+        | map(.hooks = ((.hooks // []) | map(select(.command != $stopfailure))))
+        | map(select((.hooks // []) | length > 0)))
+      | if (.hooks.StopFailure | length == 0) then del(.hooks.StopFailure) else . end
       | if (.hooks | length == 0) then del(.hooks) else . end
     else .
     end

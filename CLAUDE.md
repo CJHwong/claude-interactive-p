@@ -121,6 +121,12 @@ tmux backend (default; tmux on PATH):
   draining instead of agent draining.
 - Cap: set `CLAUDE_PTY_TASK_WAIT_SEC` small with a longer-running task, then
   assert it finalizes near the cap with `terminal_reason: "background_timeout"`.
+- API error: in a throwaway `CLAUDE_CONFIG_DIR` (hooks installed, onboarding and
+  folder trust pre-set in its `.claude.json`), run with an invalid
+  `CLAUDE_CODE_OAUTH_TOKEN`. Assert it finalizes within seconds with
+  `is_error: true`, `terminal_reason: "api_error"` and
+  `error: "authentication_failed"`. Never point this at your real config: the
+  token override is what keeps your login out of it.
 
 script backend (`CLAUDE_PTY_NO_TMUX=1`):
 
