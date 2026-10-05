@@ -512,13 +512,16 @@ if [ -n "$transcript_path" ] && [ -f "$transcript_path" ]; then
 fi
 
 # Final envelope: -p shape + statusline subtree + new fields.
+# A draft from the StopFailure hook marks an API error; keep that verdict and
+# report it the way -p does, so a failed turn never reads as a clean one.
 jq -n \
   --argjson draft "$(cat "$CLAUDE_PTY_ENVELOPE")" \
   --argjson tx "$tx_facts" \
   --argjson dur "$duration_ms" \
   --arg term "$terminal_reason" '
-  $draft + {
-    is_error:           false,
+  ($draft.is_error == true) as $failed
+  | $draft + {
+    is_error:           $failed,
     api_error_status:   null,
     stop_reason:        $tx.stop_reason,
     num_turns:          $tx.num_turns,
@@ -529,7 +532,7 @@ jq -n \
     usage:              $tx.usage,
     modelUsage:         $tx.modelUsage,
     permission_denials: [],
-    terminal_reason:    $term,
+    terminal_reason:    (if $failed then "api_error" else $term end),
     fast_mode_state:    (if ($draft.statusline.fast_mode // false) then "on" else "off" end),
     uuid:               $tx.uuid
   }

@@ -94,11 +94,12 @@ Superset of `claude -p --output-format=json`. Every `-p` key is present, plus:
 | `duration_ms` | wall-clock measured by the wrapper |
 | `duration_api_ms` | statusline `cost.total_api_duration_ms` |
 | `fast_mode_state` | `on`/`off` from statusline |
-| `terminal_reason` | `completed`, or `background_timeout` if the background-task wait cap fired |
+| `terminal_reason` | `completed`; `background_timeout` if the background-task wait cap fired; `api_error` if the turn died on an API error |
 | `compact` | PostCompact hook, on a manual `/compact` only: `{ result, trigger }` |
+| `error`, `error_details` | StopFailure hook, on an API error only: the category (`authentication_failed`, ...) |
 
 Always-null stubs: `ttft_ms`, `api_error_status`. Always present:
-`permission_denials` (`[]`), `is_error` (`false`).
+`permission_denials` (`[]`), `is_error` (`true` only for an API error).
 
 ### Env vars
 
@@ -132,10 +133,12 @@ exit. Three pieces cooperate per turn:
 3. **`hooks/stop_envelope.sh`** fires on `Stop`, merges the Stop payload with
    the sidecar into the envelope, and writes it. The envelope appearing is the
    turn-done signal.
-4. **`hooks/postcompact_envelope.sh`** covers the one turn that fires no `Stop`
-   (see [Compaction](#compaction)).
+4. **`hooks/postcompact_envelope.sh`** covers a manual `/compact`, which fires
+   no `Stop` (see [Compaction](#compaction)).
+5. **`hooks/stopfailure_envelope.sh`** covers a turn that dies on an API error,
+   which fires `StopFailure` instead of `Stop` (see [API errors](#api-errors)).
 
-Without the `CLAUDE_PTY_*` env vars all three hooks no-op, so they're safe to
+Without the `CLAUDE_PTY_*` env vars all four hooks no-op, so they're safe to
 leave installed in your real config.
 
 ### Compaction
@@ -160,6 +163,21 @@ pre-compaction context reading is worse than reporting none. Token counts aren't
 in the envelope either — they belong to the transcript's `compact_boundary`
 record (`preTokens` / `postTokens` / `durationMs`), which is authoritative.
 
+### API errors
+
+A turn that fails on an API error (an expired login, a 429, an overloaded
+model) fires `StopFailure` instead of `Stop`, and claude's TUI goes back to its
+input box. With only the Stop writer, the run then hangs until the caller's
+timeout and reports a timeout that hides the real error.
+`hooks/stopfailure_envelope.sh` writes the envelope instead, so the run ends
+within seconds as `is_error: true`, `terminal_reason: api_error`, with
+claude's message in `result` and its category in `error`. That matches what
+`claude -p --output-format=json` reports for the same failure, except that the
+hook payload carries no HTTP status, so `api_error_status` stays null.
+
+"Not logged in" (no credential at all) is a local check that fires no hook, so
+it still hangs to the caller's timeout.
+
 ### Background work
 
 A turn can finish while a subagent or teammate it spawned is still running.
@@ -175,7 +193,8 @@ Tested against Claude Code `2.1.195`. The Stop hook reads
 `last_assistant_message` (undocumented; falls back to `transcript_path`).
 Background-task waiting reads `background_tasks`, available in `2.1.145`+.
 The compaction hook reads `PostCompact`'s `trigger` and `compact_summary`,
-verified against `2.1.220`.
+verified against `2.1.220`. The API-error hook reads `StopFailure`'s `error`
+and `last_assistant_message`, verified against `2.1.289`.
 
 ## License
 

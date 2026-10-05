@@ -26,7 +26,7 @@
 #   CLAUDE_INTERACTIVE_P_REF      branch/tag/sha to fetch from raw.gh in curl
 #                                 mode. Default: main
 #   CLAUDE_PTY_NO_STATUSLINE     when 1, skip wiring statusLine.command. Both
-#                                 the Stop and PostCompact hooks are still
+#                                 the Stop, PostCompact and StopFailure hooks are still
 #                                 installed. For callers that don't consume the
 #                                 statusline subtree (and that serialize startup
 #                                 themselves, since without the shim the lock's
@@ -51,7 +51,7 @@ if [ -z "$SCRIPT_DIR" ] || [ ! -f "$SCRIPT_DIR/hooks/statusline.sh" ]; then
   mkdir -p "$TARGET/bin" "$TARGET/hooks"
 
   # Files actually needed at runtime. Examples/ stay on GitHub.
-  for rel in install.sh uninstall.sh bin/claude-pty hooks/statusline.sh hooks/stop_envelope.sh hooks/postcompact_envelope.sh; do
+  for rel in install.sh uninstall.sh bin/claude-pty hooks/statusline.sh hooks/stop_envelope.sh hooks/postcompact_envelope.sh hooks/stopfailure_envelope.sh; do
     echo "  fetching $rel"
     curl -fsSL "$RAW_BASE/$rel" -o "$TARGET/$rel"
   done
@@ -59,7 +59,7 @@ if [ -z "$SCRIPT_DIR" ] || [ ! -f "$SCRIPT_DIR/hooks/statusline.sh" ]; then
   chmod +x "$TARGET/install.sh" "$TARGET/uninstall.sh" \
            "$TARGET/bin/claude-pty" \
            "$TARGET/hooks/statusline.sh" "$TARGET/hooks/stop_envelope.sh" \
-           "$TARGET/hooks/postcompact_envelope.sh"
+           "$TARGET/hooks/postcompact_envelope.sh" "$TARGET/hooks/stopfailure_envelope.sh"
 
   exec "$TARGET/install.sh" "$@"
 fi
@@ -72,6 +72,9 @@ STOP="$REPO_DIR/hooks/stop_envelope.sh"
 # otherwise hang the run. See the header of the script for why it is gated on
 # trigger == "manual".
 POSTCOMPACT="$REPO_DIR/hooks/postcompact_envelope.sh"
+# Writes the envelope for a turn that dies on an API error (an expired login, a
+# 429), which fires StopFailure instead of Stop and would otherwise hang the run.
+STOPFAILURE="$REPO_DIR/hooks/stopfailure_envelope.sh"
 
 # When 0, leave statusLine.command alone and install only the Stop hook.
 WIRE_STATUSLINE=1
@@ -84,6 +87,7 @@ command -v jq >/dev/null 2>&1 || { echo "install.sh: jq is required" >&2; exit 1
 [ "$WIRE_STATUSLINE" = "1" ] && { [ -x "$SHIM" ] || { echo "install.sh: $SHIM is not executable" >&2; exit 1; }; }
 [ -x "$STOP" ] || { echo "install.sh: $STOP is not executable" >&2; exit 1; }
 [ -x "$POSTCOMPACT" ] || { echo "install.sh: $POSTCOMPACT is not executable" >&2; exit 1; }
+[ -x "$STOPFAILURE" ] || { echo "install.sh: $STOPFAILURE is not executable" >&2; exit 1; }
 
 mkdir -p "$CFG_DIR"
 if [ ! -f "$SETTINGS" ]; then
@@ -109,6 +113,7 @@ else
 fi
 echo "  - append Stop hook to .hooks.Stop[] (deduped)"
 echo "  - append PostCompact hook to .hooks.PostCompact[] (deduped)"
+echo "  - append StopFailure hook to .hooks.StopFailure[] (deduped)"
 echo
 
 if [ -z "${CLAUDE_PTY_YES:-}" ] && [ -e /dev/tty ]; then
@@ -155,7 +160,8 @@ if [ "$WIRE_STATUSLINE" = "1" ]; then
   updated=$(jq \
     --arg shim "$SHIM" \
     --arg stop "$STOP" \
-    --arg postcompact "$POSTCOMPACT" '
+    --arg postcompact "$POSTCOMPACT" \
+    --arg stopfailure "$STOPFAILURE" '
       .statusLine = { type: "command", command: $shim }
     | .hooks = (.hooks // {})
     | .hooks.Stop = (
@@ -170,11 +176,18 @@ if [ "$WIRE_STATUSLINE" = "1" ]; then
           | map(select((.hooks // []) | length > 0)))
         + [ { hooks: [ { type: "command", command: $postcompact } ] } ]
       )
+    | .hooks.StopFailure = (
+        ((.hooks.StopFailure // [])
+          | map(.hooks = ((.hooks // []) | map(select(.command != $stopfailure))))
+          | map(select((.hooks // []) | length > 0)))
+        + [ { hooks: [ { type: "command", command: $stopfailure } ] } ]
+      )
   ' "$SETTINGS")
 else
   updated=$(jq \
     --arg stop "$STOP" \
-    --arg postcompact "$POSTCOMPACT" '
+    --arg postcompact "$POSTCOMPACT" \
+    --arg stopfailure "$STOPFAILURE" '
       .hooks = (.hooks // {})
     | .hooks.Stop = (
         ((.hooks.Stop // [])
@@ -187,6 +200,12 @@ else
           | map(.hooks = ((.hooks // []) | map(select(.command != $postcompact))))
           | map(select((.hooks // []) | length > 0)))
         + [ { hooks: [ { type: "command", command: $postcompact } ] } ]
+      )
+    | .hooks.StopFailure = (
+        ((.hooks.StopFailure // [])
+          | map(.hooks = ((.hooks // []) | map(select(.command != $stopfailure))))
+          | map(select((.hooks // []) | length > 0)))
+        + [ { hooks: [ { type: "command", command: $stopfailure } ] } ]
       )
   ' "$SETTINGS")
 fi
