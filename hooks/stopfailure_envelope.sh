@@ -23,7 +23,12 @@
 # thread's reply hit a 429), and an empty list would end the wait and kill
 # teammate B mid-flight. Carrying the list keeps the wait, and a later clean Stop
 # replaces this draft. With no earlier Stop the turn itself failed, so there is
-# nothing to drain and the list is empty. StopFailure is the MAIN thread's: in
+# nothing to drain and the list is empty.
+#
+# A broken login is the exception: the list is dropped and the wait ends. Every
+# later wake-up turn hits the same login, so no clean Stop can come to rewrite
+# the list, and the copied list still names the teammate whose finish woke the
+# main thread. Keeping it would hold the run until CLAUDE_PTY_TASK_WAIT_SEC. StopFailure is the MAIN thread's: in
 # 2.1.289 its emitter returns early for a subagent context, the same guard the
 # Stop path uses before it fires SubagentStop, so a subagent's 429 never writes
 # here. No statusline
@@ -40,8 +45,9 @@ if [ -z "${CLAUDE_PTY_ENVELOPE:-}" ]; then
   exit 0
 fi
 
+error=$(printf '%s' "$input" | jq -r '.error // "unknown"' 2>/dev/null) || error=unknown
 pending='[]'
-if [ -f "$CLAUDE_PTY_ENVELOPE" ]; then
+if [ "$error" != "authentication_failed" ] && [ -f "$CLAUDE_PTY_ENVELOPE" ]; then
   pending=$(jq -c '.background_tasks // []' "$CLAUDE_PTY_ENVELOPE" 2>/dev/null) || pending='[]'
 fi
 
@@ -68,5 +74,5 @@ envelope=$(jq -n \
 tmp="${CLAUDE_PTY_ENVELOPE}.tmp.$$"
 printf '%s\n' "$envelope" > "$tmp"
 mv "$tmp" "$CLAUDE_PTY_ENVELOPE"
-log "stopfailure: envelope written (error=$(printf '%s' "$input" | jq -r '.error // "unknown"')); parent will terminate claude"
+log "stopfailure: envelope written (error=$error); parent will terminate claude"
 exit 0

@@ -78,6 +78,23 @@ CLAUDE_PTY_TMUX_SESSION=drain "$repo/bin/claude-pty" prompt > "$scratch/drain.js
 jq -e '.is_error == false and .result == "all done"' "$scratch/drain.json" > /dev/null \
   || fail "drain: a failed wake-up turn ended the wait for a running teammate"
 
+# A broken login ends the drain wait: no later wake-up can get past it, so the
+# still-listed teammate would otherwise hold the run to the task-wait cap.
+cat > "$scratch/bin/claude" <<'CLAUDE'
+#!/usr/bin/env bash
+printf '%s\n' '{"result":"spawned","background_tasks":[{"id":"t2","type":"teammate"}]}' > "$CLAUDE_PTY_ENVELOPE"
+sleep 1
+printf '%s\n' '{"hook_event_name":"StopFailure","error":"authentication_failed","last_assistant_message":"Login expired · Please run /login"}' \
+  | "$CLAUDE_PTY_TEST_HOOK"
+sleep 60
+CLAUDE
+start=$(date +%s)
+CLAUDE_PTY_TMUX_SESSION=authdrain "$repo/bin/claude-pty" prompt > "$scratch/authdrain.json" 2> "$scratch/authdrain.err" \
+  || { cat "$scratch/authdrain.err" >&2; fail "auth drain: claude-pty exited non-zero"; }
+elapsed=$(( $(date +%s) - start ))
+[ "$elapsed" -lt 20 ] || fail "auth drain: took ${elapsed}s; a broken login did not end the wait"
+check_envelope "auth drain" "$scratch/authdrain.json"
+
 # A normal turn still reads as a clean one: a Stop draft carries no is_error.
 cat > "$scratch/bin/claude" <<'CLAUDE'
 #!/usr/bin/env bash
