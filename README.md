@@ -20,6 +20,12 @@ Built for [claude-on-the-fly](https://github.com/CJHwong/claude-on-the-fly).
 curl -fsSL https://raw.githubusercontent.com/CJHwong/claude-interactive-p/main/install.sh | bash
 ```
 
+The installer first warns that a piped script runs as you and asks `[Y/n]` on the terminal. An agent or CI job has no terminal, so it passes `-y` (or sets `CLAUDE_PTY_YES=1`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/CJHwong/claude-interactive-p/main/install.sh | bash -s -- -y
+```
+
 Then:
 
 ```bash

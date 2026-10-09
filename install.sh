@@ -17,7 +17,12 @@
 #      then re-execs itself from that location so step 1's logic runs.
 #      No git clone, just curl.
 #
+# Every run first warns that it runs downloaded code as you and asks [Y/n] on
+# the terminal. With no terminal (an agent, CI), pass -y or set CLAUDE_PTY_YES:
+#   curl -fsSL .../install.sh | bash -s -- -y
+#
 # Env vars honored:
+#   CLAUDE_PTY_YES                when set, same as -y: skip both prompts.
 #   CLAUDE_CONFIG_DIR             config dir to write to. Default: ~/.claude
 #   CLAUDE_INTERACTIVE_P_HOME     where to drop files in curl mode.
 #                                 Default: ~/.local/share/claude-interactive-p
@@ -33,6 +38,40 @@
 #                                 release signal never arrives).
 #
 set -euo pipefail
+
+ASSUME_YES=0
+[ -n "${CLAUDE_PTY_YES:-}" ] && ASSUME_YES=1
+for arg in "$@"; do
+  case "$arg" in
+    -y|--yes) ASSUME_YES=1 ;;
+  esac
+done
+
+# A piped install runs whatever the server sends, with your permissions, so ask
+# first. The answer comes from /dev/tty because stdin is the script itself. The
+# curl path re-execs itself after the fetch; the marker keeps it from asking twice.
+confirm_install() {
+  cat >&2 <<'EOF'
+WARNING: this installer downloads code from the internet and runs it as you.
+It can read, change, or delete anything your user account can.
+The server can send different code each time, so read the script first:
+  https://github.com/CJHwong/claude-interactive-p/blob/main/install.sh
+Pass -y to skip this question (for agents and CI).
+EOF
+  if ! (: </dev/tty) 2>/dev/null; then
+    echo "install.sh: no terminal to ask on; re-run with -y to accept the risk" >&2
+    exit 1
+  fi
+  printf 'Proceed? [Y/n] ' >&2
+  local answer=""
+  read -r answer </dev/tty || answer=""
+  case "$answer" in
+    n|N|no|No|NO) echo "install.sh: aborted" >&2; exit 1 ;;
+  esac
+}
+if [ "$ASSUME_YES" = 0 ] && [ -z "${_CLAUDE_PTY_RISK_ACCEPTED:-}" ]; then
+  confirm_install
+fi
 
 SCRIPT_SOURCE="${BASH_SOURCE[0]:-$0}"
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_SOURCE" 2>/dev/null)" 2>/dev/null && pwd || echo "")"
@@ -61,7 +100,7 @@ if [ -z "$SCRIPT_DIR" ] || [ ! -f "$SCRIPT_DIR/hooks/statusline.sh" ]; then
            "$TARGET/hooks/statusline.sh" "$TARGET/hooks/stop_envelope.sh" \
            "$TARGET/hooks/postcompact_envelope.sh" "$TARGET/hooks/stopfailure_envelope.sh"
 
-  exec "$TARGET/install.sh" "$@"
+  _CLAUDE_PTY_RISK_ACCEPTED=1 exec "$TARGET/install.sh" "$@"
 fi
 
 # Local-install path begins here.
@@ -97,7 +136,7 @@ fi
 
 # Preview what's about to change and ask before mutating. Read from /dev/tty
 # (not stdin) so the confirm works even when the script was piped from curl.
-# Skip the prompt entirely when CLAUDE_PTY_YES is set or no tty is available.
+# Skip the prompt entirely under -y / CLAUDE_PTY_YES or when no tty is available.
 echo
 echo "About to update $SETTINGS:"
 echo "  - back up to $SETTINGS.bak.<timestamp>"
@@ -116,7 +155,7 @@ echo "  - append PostCompact hook to .hooks.PostCompact[] (deduped)"
 echo "  - append StopFailure hook to .hooks.StopFailure[] (deduped)"
 echo
 
-if [ -z "${CLAUDE_PTY_YES:-}" ] && [ -e /dev/tty ]; then
+if [ "$ASSUME_YES" = 0 ] && [ -e /dev/tty ]; then
   printf "Proceed? [Y/n] " >&2
   read -r ans </dev/tty || ans=""
   case "$ans" in
